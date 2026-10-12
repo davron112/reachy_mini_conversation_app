@@ -140,6 +140,7 @@ class LocalStream:
         self._settings_initialized = False
         self._asyncio_loop = None
         self._mic_muted = False  # mic starts live; the UI toggles it via the settings API
+        self._audio_warming_up = False
         self._backend_connection_state = "not_started"
         self._backend_error: str | None = None
         self._backend_retry_delay = BACKEND_RETRY_DELAY_SECONDS
@@ -785,6 +786,7 @@ class LocalStream:
             self._set_backend_connection_state("not_started")
 
         # Start media after key is set/available
+        self._audio_warming_up = True
         self._robot.media.start_recording()
         self._robot.media.start_playing()
 
@@ -794,16 +796,19 @@ class LocalStream:
             self._asyncio_loop = loop  # type: ignore[assignment]
             # Connect the backend first so it overlaps the warmup and audio config below.
             handler_task = asyncio.create_task(self._run_handler_startup_loop(), name="realtime-handler")
-            self._tasks = [handler_task]
-            await asyncio.gather(
-                asyncio.sleep(1),  # give the pipelines time to start
-                asyncio.to_thread(apply_audio_startup_config, self._robot, logger=logger),
-            )
-            self._tasks += [
+            self._tasks = [
+                handler_task,
                 asyncio.create_task(self.record_loop(), name="stream-record-loop"),
-                asyncio.create_task(self.play_loop(), name="stream-play-loop"),
             ]
             try:
+                await asyncio.gather(
+                    asyncio.sleep(1),  # give the pipelines time to start
+                    asyncio.to_thread(apply_audio_startup_config, self._robot, logger=logger),
+                )
+                if self._stop_event.is_set():
+                    return
+                self._audio_warming_up = False
+                self._tasks.append(asyncio.create_task(self.play_loop(), name="stream-play-loop"))
                 await asyncio.gather(*self._tasks)
             except asyncio.CancelledError:
                 logger.info("Tasks cancelled during shutdown")
@@ -882,8 +887,10 @@ class LocalStream:
         logger.debug(f"Audio recording started at {input_sample_rate} Hz")
 
         while not self._stop_event.is_set():
-            audio_frame = self._robot.media.get_audio_sample()
-            if audio_frame is not None and not self._mic_muted:
+            warming_up = self._audio_warming_up
+            audio_frame = await asyncio.to_thread(self._robot.media.get_audio_sample)
+            # A read spanning the end of warmup can still contain configuration audio.
+            if audio_frame is not None and not warming_up and not self._audio_warming_up and not self._mic_muted:
                 await self.handler.receive((input_sample_rate, audio_frame))
                 self._emit_level("user", audio_frame)
             await asyncio.sleep(0)  # avoid busy loop
