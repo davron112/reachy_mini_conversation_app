@@ -169,8 +169,6 @@ reachy-mini-conversation-app
 
 The app runs in console mode. Add `--ui` to serve the web interface at http://127.0.0.1:7860/.
 
-Microphone audio captured during pipeline warmup and audio-board configuration is discarded. Conversation input starts after both finish, while backend connection setup runs concurrently.
-
 ### CLI options
 
 | Option | Default | Description |
