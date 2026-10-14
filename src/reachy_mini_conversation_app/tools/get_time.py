@@ -24,7 +24,8 @@ def _load_timezone(name: str) -> ZoneInfo | None:
     """Return the IANA timezone with this name, or None when it is unknown."""
     try:
         return ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError):
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        # OSError: region folders like "Canada" or "US" exist in the zoneinfo tree but are not zones.
         return None
 
 

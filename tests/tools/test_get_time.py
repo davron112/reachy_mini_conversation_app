@@ -63,7 +63,11 @@ async def test_get_time_compares_two_timezones() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "arguments",
-    [{"timezone": "Mars/Olympus_Mons"}, {"timezone": "Asia/Tokyo", "compare_timezone": "../etc/passwd"}],
+    [
+        {"timezone": "Mars/Olympus_Mons"},
+        {"timezone": "Canada"},
+        {"timezone": "Asia/Tokyo", "compare_timezone": "../etc/passwd"},
+    ],
 )
 async def test_get_time_rejects_unknown_timezones(arguments: dict[str, str]) -> None:
     """An invalid timezone name should come back as a tool error."""
