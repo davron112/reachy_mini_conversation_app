@@ -396,9 +396,7 @@ def read_installed_tool_spaces(instance_path: str | Path | None) -> InstalledToo
             )
         )
     known_bundled_slugs = set(bundled_space_slugs)
-    # Dropping a retired slug from the bundled list too keeps a later explicit reinstall of that Space.
-    retired_slugs = known_bundled_slugs.intersection(_RETIRED_BUNDLED_SPACE_SLUGS)
-    spaces = [space for space in spaces if space.slug not in retired_slugs]
+    spaces = [space for space in spaces if space.slug not in _RETIRED_BUNDLED_SPACE_SLUGS]
     new_bundled_space_slugs: list[str] = []
     for bundled_space in _preinstalled_installed_spaces():
         if bundled_space.slug not in known_bundled_slugs:
@@ -411,7 +409,7 @@ def read_installed_tool_spaces(instance_path: str | Path | None) -> InstalledToo
         bundled_space_slugs=[
             slug
             for slug in dict.fromkeys([*bundled_space_slugs, *PREINSTALLED_TOOL_SPACE_SPECS])
-            if slug not in retired_slugs
+            if slug not in _RETIRED_BUNDLED_SPACE_SLUGS
         ],
         new_bundled_space_slugs=new_bundled_space_slugs,
     )
@@ -626,6 +624,10 @@ def build_remote_client(
 async def resolve_tool_space(slug: str) -> InstalledToolSpace:
     """Validate and discover tools from one HF Space, authenticating private Spaces with the HF token."""
     validated_slug = validate_space_slug(slug)
+    if validated_slug in _RETIRED_BUNDLED_SPACE_SLUGS:
+        raise ValueError(
+            "The time Space has been replaced by the built-in get_time tool. Enable it under Tool access."
+        )
     alias = normalize_space_alias(validated_slug)
     token = config.HF_TOKEN or get_token()
     try:

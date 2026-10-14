@@ -209,7 +209,7 @@ Every bundled profile enables `head_tracking` by default; users can still disabl
 | `forget` | Remove a saved memory fact by matching a short query. | Core install only. |
 | `volume_control` | Read or change Reachy's speaker or microphone volume. | Core install only. Uses the daemon REST API; setting the speaker volume plays a short confirmation sound. |
 | `robot_status` | Read one status topic: `name`, `software` (version, update available), `wifi` (IP address, network), `account` (Hugging Face sign-in), `imu` (which way the head is tilted, motion, temperature), `apps` (installed apps). | Core install only. Uses the daemon REST API. The update check and the Wi-Fi network details are wireless-version only; the IP address is reported on any robot. |
-| `get_time` | Report the current date and time for a timezone or the user's local time, or the difference between two timezones. | Core install only. Local time uses the host clock. When that clock has no timezone set (UTC, or the wireless image's `Europe/London` default), the timezone is looked up from the public IP via [ipwho.is](https://ipwho.is) and cached. |
+| `get_time` | Report the current date and time for a timezone or the user's local time, or the difference between two timezones. | Core install only. Runs offline and uses the app host's effective timezone, including process timezone overrides. Local UTC/GMT or London time includes a caveat because it may still be an image default; pass an explicit IANA timezone to get the time for a specific location. |
 | `pollen_robotics_reachy_mini_search_tool__search_web` | Search the web and return a short list of results. | Preinstalled MCP Space: `pollen-robotics/reachy-mini-search-tool`. |
 | `pollen_robotics_reachy_mini_weather_tool__get_weather` | Report today's weather for a place: current conditions, high and low temperature, and rain chance. | Preinstalled MCP Space: `pollen-robotics/reachy-mini-weather-tool`. |
 | `pollen_robotics_reachy_mini_knowledge_tool__get_info` | Read the official overview, capabilities, versions, and prices for a Pollen Robotics product or the company. | Preinstalled MCP Space: `pollen-robotics/reachy-mini-knowledge-tool`. |
@@ -379,7 +379,7 @@ reachy-mini-conversation-app tool-spaces list
 reachy-mini-conversation-app tool-spaces remove owner/space-name
 ```
 
-Bundled Pollen Spaces use static specs and are enabled by the default profile. Newly bundled Spaces are added to existing installations without restoring older tools the user removed. The former time Space is dropped from existing installations, and profiles that enabled it use the built-in `get_time` tool instead. Custom Spaces are validated through the Hugging Face Hub; HF tokens are sent only to private Spaces. Tool metadata is cached in:
+Bundled Pollen Spaces use static specs and are enabled by the default profile. Newly bundled Spaces are added to existing installations without restoring older tools the user removed. The former time Space is dropped from existing installations, and profiles that enabled it use the built-in `get_time` tool instead. Reinstalling that Space is rejected; enable `get_time` under Tool access. Custom Spaces are validated through the Hugging Face Hub; HF tokens are sent only to private Spaces. Tool metadata is cached in:
 
 - `installed_tool_spaces.json` in the managed app instance directory
 - `external_content/installed_tool_spaces.json` in terminal mode

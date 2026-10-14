@@ -1,5 +1,8 @@
+import os
+import sys
+import time
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
-from collections.abc import Callable
 
 import httpx
 import pytest
@@ -13,29 +16,12 @@ def _deps() -> ToolDependencies:
 
 
 def _host_timezone(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
-    """Point the host clock's /etc/localtime at a zoneinfo entry."""
-    monkeypatch.setattr(get_time_module.os, "readlink", lambda path: f"/usr/share/zoneinfo/{name}")
-
-
-def _ip_lookup(monkeypatch: pytest.MonkeyPatch, respond: Callable[[httpx.Request], httpx.Response]) -> list[str]:
-    """Answer the IP timezone lookup with respond and record the requested URLs."""
-    requested_urls: list[str] = []
-    real_client = httpx.AsyncClient
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        requested_urls.append(str(request.url))
-        return respond(request)
-
-    monkeypatch.setattr(
-        get_time_module.httpx,
-        "AsyncClient",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handle), **kwargs),
-    )
-    return requested_urls
-
-
-def _unreachable(request: httpx.Request) -> httpx.Response:
-    raise httpx.ConnectError("offline", request=request)
+    instant = datetime(2026, 7, 1, 12, tzinfo=UTC)
+    host_zone = get_time_module.ZoneInfo(name)
+    host_clock = MagicMock(wraps=instant)
+    host_clock.astimezone.side_effect = lambda zone=None: instant.astimezone(host_zone if zone is None else zone)
+    monkeypatch.setattr(get_time_module, "datetime", MagicMock(now=MagicMock(return_value=host_clock)))
+    monkeypatch.setattr(httpx, "AsyncClient", MagicMock(side_effect=AssertionError("Time queries must stay offline")))
 
 
 @pytest.mark.asyncio
@@ -77,54 +63,77 @@ async def test_get_time_rejects_unknown_timezones(arguments: dict[str, str]) -> 
 
 
 @pytest.mark.asyncio
-async def test_get_time_uses_a_configured_host_timezone_without_a_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Local time should come straight from a host clock that has a timezone set."""
+async def test_get_time_uses_the_effective_host_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The effective host clock should take precedence over the localtime symlink."""
     _host_timezone(monkeypatch, "Asia/Tokyo")
-    requested_urls = _ip_lookup(monkeypatch, _unreachable)
+    monkeypatch.setattr(os, "readlink", lambda path: "/usr/share/zoneinfo/Europe/Zurich")
 
     result = await get_time_module.GetTime()(_deps())
 
-    assert result["timezone"] == "Asia/Tokyo"
+    assert result["timezone"] == "JST"
     assert result["utc_offset_minutes"] == 540
+    assert result["time"] == "21:00"
     assert "note" not in result
-    assert requested_urls == []
-
-
-@pytest.mark.asyncio
-async def test_get_time_locates_an_unset_robot_clock_by_ip_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A robot still on the image's default timezone should be located by IP, and only once."""
-    _host_timezone(monkeypatch, "Europe/London")
-    requested_urls = _ip_lookup(
-        monkeypatch,
-        lambda request: httpx.Response(200, json={"success": True, "timezone": {"id": "Asia/Tokyo"}}),
-    )
-    tool = get_time_module.GetTime()
-
-    first = await tool(_deps())
-    second = await tool(_deps(), timezone="")
-
-    assert first["timezone"] == second["timezone"] == "Asia/Tokyo"
-    assert first["utc_offset_minutes"] == 540
-    assert "note" not in first
-    assert len(requested_urls) == 1
-    assert requested_urls[0].startswith("https://ipwho.is/")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "respond",
-    [_unreachable, lambda request: httpx.Response(200, json={"success": False, "message": "rate limited"})],
+    ("host_timezone", "expected_name", "expected_offset"),
+    [("UTC", "UTC", 0), ("GMT", "GMT", 0), ("Europe/London", "BST", 60)],
 )
-async def test_get_time_flags_an_unset_clock_when_the_lookup_fails(
+async def test_get_time_qualifies_possible_defaults_without_a_symlink(
     monkeypatch: pytest.MonkeyPatch,
-    respond: Callable[[httpx.Request], httpx.Response],
+    host_timezone: str,
+    expected_name: str,
+    expected_offset: int,
 ) -> None:
-    """Without a location, an unset clock's time must be returned with a warning instead of passed off as local."""
-    _host_timezone(monkeypatch, "Etc/UTC")
-    _ip_lookup(monkeypatch, respond)
+    """A copied localtime file should not hide a possibly unconfigured host timezone."""
+    _host_timezone(monkeypatch, host_timezone)
+    monkeypatch.setattr(os, "readlink", MagicMock(side_effect=OSError("not a symlink")))
 
     result = await get_time_module.GetTime()(_deps())
 
-    assert result["timezone"] == "Etc/UTC"
-    assert result["utc_offset_minutes"] == 0
+    assert result["timezone"] == expected_name
+    assert result["utc_offset_minutes"] == expected_offset
     assert "may not be the user's local time" in result["note"]
+    assert "no timezone set" not in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_get_time_preserves_london_without_ip_inference(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A London host should keep its own time even when it matches the wireless image default."""
+    _host_timezone(monkeypatch, "Europe/London")
+    monkeypatch.setattr(os, "readlink", lambda path: "/usr/share/zoneinfo/Europe/London")
+
+    result = await get_time_module.GetTime()(_deps(), compare_timezone="Asia/Tokyo")
+
+    assert result["timezone"] == "BST"
+    assert result["time"] == "13:00"
+    assert result["time_difference_minutes"] == 480
+    assert "note" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timezone", ["UTC", "Europe/London"])
+async def test_get_time_does_not_qualify_explicit_timezones(timezone: str) -> None:
+    """An explicitly requested timezone should not be treated as an uncertain host default."""
+    result = await get_time_module.GetTime()(_deps(), timezone=timezone)
+
+    assert result["timezone"] == timezone
+    assert "note" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX TZ overrides are not supported on Windows")
+async def test_get_time_honors_a_process_timezone_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A process timezone override should apply without changing system configuration."""
+    try:
+        with monkeypatch.context() as environment:
+            environment.setenv("TZ", "Asia/Tokyo")
+            time.tzset()
+            result = await get_time_module.GetTime()(_deps())
+    finally:
+        time.tzset()
+
+    assert result["utc_offset_minutes"] == 540
+    assert result["timezone"] == "JST"

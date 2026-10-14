@@ -615,20 +615,19 @@ def test_read_installed_tool_spaces_adds_new_bundled_space_to_v2_manifest(tmp_pa
 
 
 @pytest.mark.parametrize(
-    ("manifest_fields", "keeps_time_space"),
+    "manifest_fields",
     [
-        ({"version": 2}, False),
-        ({"version": 3, "bundled_space_slugs": [TIME_SPACE_SLUG, *CURRENT_BUNDLED_SPACE_SLUGS]}, False),
-        ({"version": 3, "bundled_space_slugs": CURRENT_BUNDLED_SPACE_SLUGS}, True),
+        {"version": 2},
+        {"version": 3, "bundled_space_slugs": [TIME_SPACE_SLUG, *CURRENT_BUNDLED_SPACE_SLUGS]},
+        {"version": 3, "bundled_space_slugs": CURRENT_BUNDLED_SPACE_SLUGS},
     ],
     ids=["seeded-v2", "seeded-v3", "reinstalled"],
 )
-def test_read_installed_tool_spaces_retires_only_the_seeded_time_space(
+def test_read_installed_tool_spaces_retires_the_time_space(
     tmp_path: Path,
     manifest_fields: dict[str, object],
-    keeps_time_space: bool,
 ) -> None:
-    """The time Space seeded by earlier versions is dropped, while one the user reinstalled is kept."""
+    """Retired time Spaces should not be offered even if explicitly reinstalled by an earlier version."""
     time_space = {
         "slug": TIME_SPACE_SLUG,
         "alias": "pollen_robotics_reachy_mini_time_tool",
@@ -643,8 +642,27 @@ def test_read_installed_tool_spaces_retires_only_the_seeded_time_space(
 
     manifest = read_installed_tool_spaces(tmp_path)
 
-    assert (TIME_SPACE_SLUG in [space.slug for space in manifest.spaces]) is keeps_time_space
+    assert TIME_SPACE_SLUG not in [space.slug for space in manifest.spaces]
     assert manifest.bundled_space_slugs == CURRENT_BUNDLED_SPACE_SLUGS
+
+
+@pytest.mark.parametrize("install_only", [False, True])
+def test_install_tool_space_rejects_the_retired_time_space_without_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    install_only: bool,
+) -> None:
+    """Installing the former time Space should direct users to get_time without contacting Hugging Face."""
+    space_info = MagicMock(side_effect=AssertionError("Retired Spaces must not be discovered"))
+    monkeypatch.setattr("reachy_mini_conversation_app.tool_spaces.HfApi", space_info)
+    _setup_profile(tmp_path / "profiles", "default", ["dance"])
+    monkeypatch.setattr("reachy_mini_conversation_app.profile_store.DEFAULT_PROFILES_DIRECTORY", tmp_path / "profiles")
+
+    with pytest.raises(ValueError, match="built-in get_time tool"):
+        install_tool_space(TIME_SPACE_SLUG, tmp_path, install_only=install_only)
+
+    assert not (tmp_path / "installed_tool_spaces.json").exists()
+    assert not (tmp_path / "profile_toolsets.json").exists()
 
 
 def test_migrate_bundled_tool_spaces_enables_only_new_default_tools(
