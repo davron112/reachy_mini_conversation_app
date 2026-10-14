@@ -38,6 +38,12 @@ SEARCH_ALIAS = "example_search_tool"
 SEARCH_REMOTE_NAME = "search_tool_search_web"
 SEARCH_TOOL_ID = f"{SEARCH_ALIAS}__search_web"
 SEARCH_CLIENT_TOOL_ID = f"{SEARCH_ALIAS}__{SEARCH_REMOTE_NAME}"
+TIME_SPACE_SLUG = "pollen-robotics/reachy-mini-time-tool"
+CURRENT_BUNDLED_SPACE_SLUGS = [
+    "pollen-robotics/reachy-mini-search-tool",
+    "pollen-robotics/reachy-mini-weather-tool",
+    "pollen-robotics/reachy-mini-knowledge-tool",
+]
 
 
 def _mock_public_space_info(slug: str) -> SimpleNamespace:
@@ -569,7 +575,6 @@ def test_read_installed_tool_spaces_seeds_bundled_pollen_spaces(
     spaces = read_installed_tool_spaces(None).spaces
     assert [space.slug for space in spaces] == [
         "pollen-robotics/reachy-mini-search-tool",
-        "pollen-robotics/reachy-mini-time-tool",
         "pollen-robotics/reachy-mini-weather-tool",
         "pollen-robotics/reachy-mini-knowledge-tool",
     ]
@@ -603,11 +608,43 @@ def test_read_installed_tool_spaces_adds_new_bundled_space_to_v2_manifest(tmp_pa
     assert [space.slug for space in manifest.spaces] == ["pollen-robotics/reachy-mini-knowledge-tool"]
     assert manifest.bundled_space_slugs == [
         "pollen-robotics/reachy-mini-search-tool",
-        "pollen-robotics/reachy-mini-time-tool",
         "pollen-robotics/reachy-mini-weather-tool",
         "pollen-robotics/reachy-mini-knowledge-tool",
     ]
     assert manifest.new_bundled_space_slugs == ["pollen-robotics/reachy-mini-knowledge-tool"]
+
+
+@pytest.mark.parametrize(
+    ("manifest_fields", "keeps_time_space"),
+    [
+        ({"version": 2}, False),
+        ({"version": 3, "bundled_space_slugs": [TIME_SPACE_SLUG, *CURRENT_BUNDLED_SPACE_SLUGS]}, False),
+        ({"version": 3, "bundled_space_slugs": CURRENT_BUNDLED_SPACE_SLUGS}, True),
+    ],
+    ids=["seeded-v2", "seeded-v3", "reinstalled"],
+)
+def test_read_installed_tool_spaces_retires_only_the_seeded_time_space(
+    tmp_path: Path,
+    manifest_fields: dict[str, object],
+    keeps_time_space: bool,
+) -> None:
+    """The time Space seeded by earlier versions is dropped, while one the user reinstalled is kept."""
+    time_space = {
+        "slug": TIME_SPACE_SLUG,
+        "alias": "pollen_robotics_reachy_mini_time_tool",
+        "mcp_url": "https://pollen-robotics-reachy-mini-time-tool.hf.space/gradio_api/mcp/",
+        "private": False,
+        "tools": [],
+    }
+    (tmp_path / "installed_tool_spaces.json").write_text(
+        json.dumps({**manifest_fields, "spaces": [time_space]}),
+        encoding="utf-8",
+    )
+
+    manifest = read_installed_tool_spaces(tmp_path)
+
+    assert (TIME_SPACE_SLUG in [space.slug for space in manifest.spaces]) is keeps_time_space
+    assert manifest.bundled_space_slugs == CURRENT_BUNDLED_SPACE_SLUGS
 
 
 def test_migrate_bundled_tool_spaces_enables_only_new_default_tools(

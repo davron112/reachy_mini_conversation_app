@@ -72,37 +72,6 @@ PREINSTALLED_TOOL_SPACE_SPECS = {
             },
         ),
     ),
-    "pollen-robotics/reachy-mini-time-tool": (
-        RemoteToolSpec(
-            server_alias="pollen_robotics_reachy_mini_time_tool",
-            remote_name="reachy_mini_time_tool_get_time",
-            namespaced_name=build_namespaced_tool_name(
-                "pollen_robotics_reachy_mini_time_tool", "reachy_mini_time_tool_get_time"
-            ),
-            description=(
-                "Get the current date and time for an IANA timezone, and optionally the difference to a second timezone. "
-                "Call this directly whenever the user asks what time it is or the time somewhere. Pass an IANA name like "
-                "'Europe/Paris' or 'Asia/Tokyo' for a named place (derive it from the place), or leave the timezone empty "
-                "for the user's own local time. Do not ask for their city and do not just say you'll check."
-            ),
-            parameters_schema={
-                "type": "object",
-                "properties": {
-                    "timezone": {
-                        "type": "string",
-                        "default": "",
-                        "description": "IANA timezone like 'Europe/Paris'. Empty resolves the user's local time.",
-                    },
-                    "compare_timezone": {
-                        "type": "string",
-                        "default": "",
-                        "description": "Optional second IANA timezone to compare against.",
-                    },
-                },
-                "required": [],
-            },
-        ),
-    ),
     "pollen-robotics/reachy-mini-weather-tool": (
         RemoteToolSpec(
             server_alias="pollen_robotics_reachy_mini_weather_tool",
@@ -174,6 +143,8 @@ _V2_BUNDLED_SPACE_SLUGS = (
     "pollen-robotics/reachy-mini-time-tool",
     "pollen-robotics/reachy-mini-weather-tool",
 )
+# Formerly bundled Spaces now replaced by core tools; earlier installs still list their seeded copy.
+_RETIRED_BUNDLED_SPACE_SLUGS = ("pollen-robotics/reachy-mini-time-tool",)
 _SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -425,6 +396,9 @@ def read_installed_tool_spaces(instance_path: str | Path | None) -> InstalledToo
             )
         )
     known_bundled_slugs = set(bundled_space_slugs)
+    # Dropping a retired slug from the bundled list too keeps a later explicit reinstall of that Space.
+    retired_slugs = known_bundled_slugs.intersection(_RETIRED_BUNDLED_SPACE_SLUGS)
+    spaces = [space for space in spaces if space.slug not in retired_slugs]
     new_bundled_space_slugs: list[str] = []
     for bundled_space in _preinstalled_installed_spaces():
         if bundled_space.slug not in known_bundled_slugs:
@@ -434,7 +408,11 @@ def read_installed_tool_spaces(instance_path: str | Path | None) -> InstalledToo
 
     return InstalledToolSpacesManifest(
         spaces=spaces,
-        bundled_space_slugs=list(dict.fromkeys([*bundled_space_slugs, *PREINSTALLED_TOOL_SPACE_SPECS])),
+        bundled_space_slugs=[
+            slug
+            for slug in dict.fromkeys([*bundled_space_slugs, *PREINSTALLED_TOOL_SPACE_SPECS])
+            if slug not in retired_slugs
+        ],
         new_bundled_space_slugs=new_bundled_space_slugs,
     )
 
