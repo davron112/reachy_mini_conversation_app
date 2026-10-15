@@ -134,6 +134,7 @@ export const applyPersonality = (name, { persist = false, force = false } = {}) 
   rpcCall("personalities.apply", { name, persist, force });
 export const deletePersonality = (name) => rpcCall("personalities.delete", { name });
 
+export const getConversationHistory = () => rpcCall("conversation.history");
 export const getMicState = () => rpcCall("conversation.mic", {});
 export const setMicMuted = (muted) => rpcCall("conversation.mic", { muted });
 
@@ -142,6 +143,7 @@ export const getCurrentVoice = () => rpcCall("voices.current");
 export const applyVoice = (voice) => rpcCall("voices.apply", { voice });
 
 export const saveBackendConfig = (payload) => rpcCall("backend.config", payload);
+export const saveSpeechConfig = (payload) => rpcCall("speech.config", payload);
 
 export const listToolSpaces = () => rpcCall("tool_spaces.list");
 export const addToolSpace = (slug) =>
