@@ -1,7 +1,6 @@
 """Tests for the headless console stream."""
 
 import time
-import base64
 import asyncio
 import threading
 from types import SimpleNamespace
@@ -13,7 +12,6 @@ from collections.abc import Callable
 import numpy as np
 import pytest
 from fastapi import FastAPI, HTTPException
-from numpy.typing import NDArray
 from fastapi.testclient import TestClient
 
 import reachy_mini_conversation_app.console as console_mod
@@ -25,12 +23,10 @@ from reachy_mini_conversation_app.startup_settings import (
     StartupSettings,
     load_startup_settings_into_runtime,
 )
-from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.personality_routes import (
     RouteError,
     build_personality_ops,
 )
-from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
 
 
 def _rpc_call(app: FastAPI, method: str, params: Any = None) -> dict[str, Any]:
@@ -477,10 +473,21 @@ def test_media_warmup_overlaps_audio_startup_config(monkeypatch: pytest.MonkeyPa
         asyncio.set_event_loop(asyncio.new_event_loop())
 
 
-def test_close_during_warmup_does_not_start_playback(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stopping during configuration closes the handler without starting normal audio delivery."""
+def test_launch_reads_microphone_while_audio_is_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The microphone is drained during audio configuration, so no backlog builds up before live input."""
     monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
-    handler = MagicMock(shutdown=AsyncMock(), receive=AsyncMock())
+    configuring = threading.Event()
+    read_while_configuring = threading.Event()
+
+    def read_microphone() -> None:
+        if configuring.is_set():
+            read_while_configuring.set()
+
+    def configure_audio(*_args: object, **_kwargs: object) -> None:
+        configuring.set()
+        read_while_configuring.wait(1)
+        stream.close()
+
     media = SimpleNamespace(
         audio=None,
         backend=None,
@@ -489,110 +496,44 @@ def test_close_during_warmup_does_not_start_playback(monkeypatch: pytest.MonkeyP
         stop_recording=MagicMock(),
         stop_playing=MagicMock(),
         get_input_audio_samplerate=MagicMock(return_value=16000),
-        get_audio_sample=MagicMock(return_value=None),
-    )
-    stream = LocalStream(handler, SimpleNamespace(media=media))
-    play = AsyncMock()
-    monkeypatch.setattr(stream, "play_loop", play)
-    monkeypatch.setattr(stream, "_run_handler_startup_loop", AsyncMock())
-    monkeypatch.setattr(console_mod, "apply_audio_startup_config", lambda *_args, **_kwargs: stream.close())
-    try:
-        stream.launch()
-    finally:
-        asyncio.set_event_loop(asyncio.new_event_loop())
-
-    play.assert_not_awaited()
-    handler.receive.assert_not_awaited()
-    handler.shutdown.assert_awaited_once()
-    media.stop_recording.assert_called_once()
-    assert all(task.done() for task in stream._tasks)
-
-
-@pytest.mark.parametrize("config_applied", [True, False])
-def test_launch_discards_microphone_warmup_and_forwards_live_audio(
-    monkeypatch: pytest.MonkeyPatch, config_applied: bool
-) -> None:
-    """Startup capture is drained before handler input, even if audio config is unavailable."""
-    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
-    original_sleep = asyncio.sleep
-    warmup_drained = threading.Event()
-    live_started = threading.Event()
-    warmup_frames = [np.full((320, 2), value, dtype=np.float32) for value in (0.25, 0.5)]
-    live_frame = np.full((320, 2), 0.125, dtype=np.float32)
-    reads_during_config: list[bool] = []
-    config_finished = threading.Event()
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    append = AsyncMock()
-    handler.connection = SimpleNamespace(input_audio_buffer=SimpleNamespace(append=append))
-    handler.shutdown = AsyncMock()
-    receive = AsyncMock(wraps=handler.receive)
-    monkeypatch.setattr(handler, "receive", receive)
-
-    def read_microphone() -> NDArray[np.float32] | None:
-        if warmup_frames:
-            reads_during_config.append(config_finished.is_set())
-            frame = warmup_frames.pop(0)
-            if not warmup_frames:
-                warmup_drained.set()
-            return frame
-        return live_frame if live_started.is_set() else None
-
-    media = SimpleNamespace(
-        audio=None,
-        backend=None,
-        start_recording=MagicMock(),
-        start_playing=MagicMock(),
-        get_input_audio_samplerate=MagicMock(return_value=16000),
         get_audio_sample=read_microphone,
     )
-    stream = LocalStream(handler, SimpleNamespace(media=media))
-    levels = MagicMock()
-    monkeypatch.setattr(stream, "_emit_level", levels)
-    backend_started = asyncio.Event()
-
-    async def connect_backend() -> None:
-        backend_started.set()
-        await stream._stop_event.wait()
-
-    async def warmup(delay: float) -> None:
-        if delay == 1:
-            await backend_started.wait()
-            await asyncio.to_thread(warmup_drained.wait, 0.5)
-        else:
-            await original_sleep(delay)
-
-    def configure_audio(*_args: object, **_kwargs: object) -> bool:
-        warmup_drained.wait(0.5)
-        config_finished.set()
-        return config_applied
-
-    async def play_until_live_input() -> None:
-        live_started.set()
-        while not receive.await_count:
-            await original_sleep(0)
-        stream._stop_event.set()
-
-    monkeypatch.setattr(stream, "_run_handler_startup_loop", connect_backend)
-    monkeypatch.setattr(stream, "play_loop", play_until_live_input)
-    monkeypatch.setattr(console_mod.asyncio, "sleep", warmup)
+    stream = LocalStream(MagicMock(shutdown=AsyncMock()), SimpleNamespace(media=media))
+    monkeypatch.setattr(stream, "_run_handler_startup_loop", AsyncMock())
     monkeypatch.setattr(console_mod, "apply_audio_startup_config", configure_audio)
     try:
         stream.launch()
     finally:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
-    assert reads_during_config == [False, False]
-    assert receive.await_count >= 1
-    for call in receive.await_args_list:
-        assert call.args[0][0] == 16000
-        np.testing.assert_array_equal(call.args[0][1], live_frame)
-    for call in append.await_args_list:
-        submitted = np.frombuffer(base64.b64decode(call.kwargs["audio"]), dtype=np.int16)
-        np.testing.assert_array_equal(submitted, np.full(320, 4095, dtype=np.int16))
-    assert append.await_count == receive.await_count
-    for call in levels.call_args_list:
-        np.testing.assert_array_equal(call.args[1], live_frame)
-    handler.shutdown.assert_awaited_once()
+    assert read_while_configuring.is_set()
+
+
+@pytest.mark.asyncio
+async def test_record_loop_discards_warmup_audio() -> None:
+    """Frames read while the audio board warms up never reach the handler."""
+    warmup_frame = np.full(4, 1, dtype=np.int16)
+    live_frame = np.full(4, 2, dtype=np.int16)
+    reads: list[bool] = []
+    handler = MagicMock()
+    robot = _audio_robot(get_input_audio_samplerate=MagicMock(return_value=16000), get_audio_sample=MagicMock())
+    stream = LocalStream(handler, robot)
+    stream._audio_warming_up = True
+
+    def read_microphone() -> np.ndarray:
+        reads.append(stream._audio_warming_up)
+        return warmup_frame if stream._audio_warming_up else live_frame
+
+    robot.media.get_audio_sample.side_effect = read_microphone
+    handler.receive = AsyncMock(side_effect=lambda _frame: stream._stop_event.set())
+    recording = asyncio.create_task(stream.record_loop())
+    while len(reads) < 2 and not recording.done():
+        await asyncio.sleep(0)
+    stream._audio_warming_up = False
+    await asyncio.wait_for(recording, timeout=2)
+
+    handler.receive.assert_awaited_once()
+    np.testing.assert_array_equal(handler.receive.await_args.args[0][1], live_frame)
 
 
 @pytest.mark.asyncio
