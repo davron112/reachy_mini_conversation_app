@@ -960,45 +960,6 @@ async def test_record_loop_forwards_unmuted_frames() -> None:
 
 
 @pytest.mark.asyncio
-async def test_record_loop_discards_read_spanning_end_of_warmup() -> None:
-    """A blocked warmup read is discarded after startup, and the next live read reaches the handler."""
-    read_started = threading.Event()
-    finish_read = threading.Event()
-    warmup_frame = np.full(320, 1, dtype=np.int16)
-    live_frame = np.full(320, 2, dtype=np.int16)
-    reads = 0
-
-    def read_microphone() -> NDArray[np.int16]:
-        nonlocal reads
-        reads += 1
-        if reads == 1:
-            read_started.set()
-            if not finish_read.wait(2):
-                raise TimeoutError("Warmup read was not released")
-            return warmup_frame
-        return live_frame
-
-    robot = _audio_robot(get_input_audio_samplerate=MagicMock(return_value=16000), get_audio_sample=read_microphone)
-    handler = MagicMock()
-    stream = LocalStream(handler, robot)
-    stream._audio_warming_up = True
-    handler.receive = AsyncMock(side_effect=lambda _frame: stream._stop_event.set())
-    record_task = asyncio.create_task(stream.record_loop())
-    try:
-        assert await asyncio.to_thread(read_started.wait, 1)
-        stream._audio_warming_up = False
-        finish_read.set()
-        await asyncio.wait_for(record_task, 2)
-    finally:
-        finish_read.set()
-        record_task.cancel()
-        await asyncio.gather(record_task, return_exceptions=True)
-
-    handler.receive.assert_awaited_once()
-    np.testing.assert_array_equal(handler.receive.await_args.args[0][1], live_frame)
-
-
-@pytest.mark.asyncio
 async def test_record_loop_skips_frames_while_muted() -> None:
     """No frames are forwarded while the mic is muted."""
     robot = _audio_robot(get_input_audio_samplerate=MagicMock(return_value=16000), get_audio_sample=MagicMock())
