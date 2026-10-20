@@ -24,8 +24,11 @@ import webbrowser
 from typing import TYPE_CHECKING, Any
 from collections.abc import Callable
 
+import numpy as np
+
 from reachy_mini.io.jsonrpc import JsonRpcError
 from reachy_mini.apps.jsonrpc_server import JsonRpcServer
+from reachy_mini.utils.interpolation import time_trajectory
 from reachy_mini.motion.recorded_move import RecordedMoves
 from reachy_mini_conversation_app.config import LOCKED_PROFILE
 from reachy_mini_conversation_app.personality import list_personalities
@@ -37,7 +40,7 @@ from reachy_mini_conversation_app.nfc_daemon_client import (
     NfcDaemonClient,
     describe_write_error,
 )
-from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
+from reachy_mini_conversation_app.dance_emotion_moves import GotoQueueMove, EmotionQueueMove
 
 
 if TYPE_CHECKING:
@@ -64,6 +67,8 @@ WRITE_MOVE_NAME = "write-tag-6"
 WRITE_SOUND_LEAD_S = 0.15
 PRIVACY_MOVE_DATASET = "glannuzel/local-dataset"
 PRIVACY_MOVE_NAME = "privacy-wake-up-1"
+# Time to ease from wherever the head is into the privacy move's first frame.
+PRIVACY_LEAD_IN_S = 1.0
 # Written by hand rather than through the personality token scheme, so both
 # separators are accepted.
 PRIVACY_TAG_CONTENT = "hf-privacy-hat"
@@ -130,6 +135,15 @@ def _settled(tag: NfcTagSnapshot, previous: NfcTagSnapshot | None) -> NfcTagSnap
     if tag.uid is None or previous.uid is None or tag.uid == previous.uid:
         return previous
     return _NO_TAG
+
+
+class _EasedGotoQueueMove(GotoQueueMove):
+    """Goto that starts and ends at rest, so it hands over to the next move without a jolt."""
+
+    def evaluate(self, t: float) -> Any:
+        """Evaluate the goto along a minimum-jerk time profile."""
+        progress = max(0.0, min(1.0, t / self.duration))
+        return super().evaluate(time_trajectory(progress) * self.duration)
 
 
 def _load_move_dataset(repo_id: str) -> RecordedMoves | None:
@@ -400,14 +414,44 @@ class RfidController:
             elif not tag.blank and tag.content and tag.content != previous.content:
                 self._on_tag_read(handler, tag.content)
 
-    def _queue_move(self, handler: "HuggingFaceRealtimeHandler", moves: RecordedMoves | None, name: str) -> None:
-        """Queue a recorded emotion move, doing nothing when its dataset is missing."""
+    def _queue_move(
+        self,
+        handler: "HuggingFaceRealtimeHandler",
+        moves: RecordedMoves | None,
+        name: str,
+        lead_in_s: float = 0.0,
+    ) -> None:
+        """Queue a recorded emotion move, doing nothing when its dataset is missing.
+
+        With ``lead_in_s``, the head first eases from where it is into the move's
+        first frame: a recorded move starts wherever it was recorded, and queued
+        as is the head jumps there.
+        """
         if moves is None:
             return
         try:
-            handler.deps.movement_manager.queue_move(EmotionQueueMove(name, moves))
-        except (KeyError, ValueError, RuntimeError) as exc:
+            move = EmotionQueueMove(name, moves)
+            if lead_in_s > 0.0:
+                handler.deps.movement_manager.queue_move(self._lead_in_to(move, lead_in_s))
+            handler.deps.movement_manager.queue_move(move)
+        except (KeyError, ValueError, RuntimeError, OSError) as exc:
             logger.warning("[RFID] >>> move %r failed: %s", name, exc)
+
+    def _lead_in_to(self, move: EmotionQueueMove, duration: float) -> GotoQueueMove:
+        """Build the goto from the robot's current pose to ``move``'s first frame."""
+        head, antennas, body_yaw = move.evaluate(0.0)
+        if head is None or antennas is None:
+            raise ValueError("the move has no first frame to ease into")
+        head_joints, current_antennas = self._robot.get_current_joint_positions()
+        return _EasedGotoQueueMove(
+            target_head_pose=head.astype(np.float32),
+            start_head_pose=self._robot.get_current_head_pose(),
+            target_antennas=(float(antennas[0]), float(antennas[1])),
+            start_antennas=(float(current_antennas[0]), float(current_antennas[1])),
+            target_body_yaw=float(body_yaw or 0.0),
+            start_body_yaw=float(head_joints[0]),
+            duration=duration,
+        )
 
     def _run_on_loop(self, coroutine: Any, description: str, timeout: float = 10.0) -> bool:
         """Run a handler coroutine on the conversation loop and wait for it."""
@@ -522,7 +566,7 @@ class RfidController:
             return
         logger.info("[RFID] >>> privacy hat on — no longer listening")
         self._set_privacy(True)
-        self._queue_move(handler, self._privacy_moves, PRIVACY_MOVE_NAME)
+        self._queue_move(handler, self._privacy_moves, PRIVACY_MOVE_NAME, lead_in_s=PRIVACY_LEAD_IN_S)
 
     def _leave_privacy(self, handler: "HuggingFaceRealtimeHandler", play_move: bool) -> None:
         logger.info("[RFID] >>> privacy hat off — listening again")

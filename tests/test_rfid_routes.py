@@ -392,7 +392,7 @@ def privacy(monkeypatch):
         robot=None,
         on_privacy_changed=changes.append,
     )
-    monkeypatch.setattr(controller, "_queue_move", lambda handler, dataset, name: moves.append(name))
+    monkeypatch.setattr(controller, "_queue_move", lambda handler, dataset, name, **kw: moves.append(name))
     monkeypatch.setattr(controller, "_run_on_loop", lambda coro, description, **kw: True)
     return controller, changes, moves
 
@@ -440,3 +440,50 @@ def test_swapping_the_privacy_hat_for_another_accessory_leaves_privacy(privacy, 
     # The new accessory's own transition, not a second one for leaving privacy.
     assert moves == [rfid_routes.PRIVACY_MOVE_NAME, rfid_routes.TRANSITION_MOVE_NAME]
     assert controller._current_personality == "pirate"
+
+
+def test_the_privacy_move_is_eased_into_from_the_current_pose(monkeypatch):
+    """Queued as is, the recorded move snapped the head to wherever it was recorded."""
+    import numpy as np
+
+    from reachy_mini.utils import create_head_pose
+
+    current_head = create_head_pose(0, 0, 0, 0, 20, -30, degrees=True)
+    first_head = create_head_pose(0, 0, 0, 10, 0, 0, degrees=True)
+
+    class FakeRecordedMove:
+        duration = 2.0
+
+        def evaluate(self, t):
+            return first_head, np.array([0.5, -0.5]), 0.2
+
+    class FakeRobot:
+        def get_current_head_pose(self):
+            return current_head
+
+        def get_current_joint_positions(self):
+            return [0.4, 0, 0, 0, 0, 0, 0], [-0.3, 0.3]
+
+    queued = []
+
+    class FakeManager:
+        def queue_move(self, move):
+            queued.append(move)
+
+    handler = _StubHandler()
+    handler.deps.movement_manager = FakeManager()
+    monkeypatch.setattr(rfid_routes, "_load_move_dataset", lambda repo_id: None)
+    controller = rfid_routes.RfidController(get_handler=lambda: handler, get_loop=lambda: None, robot=FakeRobot())
+
+    controller._queue_move(handler, {"privacy": FakeRecordedMove()}, "privacy", lead_in_s=1.0)
+
+    lead_in, move = queued
+    assert isinstance(move, rfid_routes.EmotionQueueMove)
+    head, antennas, body_yaw = lead_in.evaluate(0.0)
+    assert np.allclose(head, current_head) and np.allclose(antennas, [-0.3, 0.3]) and body_yaw == pytest.approx(0.4)
+    head, antennas, body_yaw = lead_in.evaluate(lead_in.duration)
+    assert np.allclose(head, first_head, atol=1e-6) and np.allclose(antennas, [0.5, -0.5])
+    assert body_yaw == pytest.approx(0.2)
+    # Minimum jerk: it barely moves at first, unlike a linear goto.
+    _, early, _ = lead_in.evaluate(0.05)
+    assert abs(early[0] - (-0.3)) < 0.01 * abs(0.5 - (-0.3))
