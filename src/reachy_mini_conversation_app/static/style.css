@@ -1421,6 +1421,11 @@ button {
   cursor: wait;
 }
 
+/* Locked by the privacy hat, not loading. */
+.convo-orb.is-locked:disabled {
+  cursor: not-allowed;
+}
+
 .convo-orb:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 6px;

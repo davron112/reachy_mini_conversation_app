@@ -33,7 +33,7 @@ const CAPTION_BY_STATE = Object.freeze({
   [ORB_STATES.SPEAKING]: "Speaking",
   [ORB_STATES.ERROR]: "Connection error",
 });
-const PRIVACY_CAPTION = "Privacy hat on · not listening";
+const PRIVACY_CAPTION = "Privacy hat on · Microphone off";
 
 export async function mountTalkView({ outlet, signal }) {
   const pending = consumePendingApply();
@@ -218,10 +218,12 @@ export async function mountTalkView({ outlet, signal }) {
     if (!micReady) return;
     orb.setState(restingState());
     caption.textContent = captionFor(restingState());
+    syncMicAria();
   }
 
   async function onMicTap() {
-    if (!micReady || togglePending) return;
+    // The hat, not the user, decides while it is on: unmuting would not be heard.
+    if (!micReady || togglePending || privacy) return;
     togglePending = true;
     try {
       const data = await setMicMuted(!muted);
@@ -278,7 +280,13 @@ export async function mountTalkView({ outlet, signal }) {
       orb.root.setAttribute("aria-label", "Loading microphone state");
       return;
     }
-    orb.root.setAttribute("aria-pressed", String(!muted));
+    orb.root.disabled = privacy;
+    orb.root.classList.toggle("is-locked", privacy);
+    orb.root.setAttribute("aria-pressed", String(!muted && !privacy));
+    if (privacy) {
+      orb.root.setAttribute("aria-label", "Microphone off while the privacy hat is on");
+      return;
+    }
     orb.root.setAttribute("aria-label", muted ? "Unmute microphone" : "Mute microphone");
   }
 }
