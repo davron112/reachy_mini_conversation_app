@@ -2,12 +2,14 @@
  * Talk view: conversation orb driven by the RPC activity stream.
  * Audio I/O runs entirely in Python; the orb doubles as the mic toggle.
  * Robot stays live, tapping the orb only mutes or unmutes the user's mic.
+ * Voice waves in the background follow the mic; the privacy hat freezes them.
  */
 
 import {
   applyPersonality,
   describeError,
   getMicState,
+  getStatus,
   linkRfidTag,
   listPersonalities,
   setMicMuted,
@@ -16,6 +18,7 @@ import {
 } from "../api.js";
 import { ORB_STATES } from "../constants.js";
 import { createOrb, mapActivityToState } from "../orb.js";
+import { createVoiceWaves } from "../voice-waves.js";
 import { consumePendingApply } from "../pending-apply.js";
 import { setPersonality } from "../personality-badge.js";
 import { onAccessoryChange, setActivePersonality } from "../accessory-badge.js";
@@ -30,6 +33,7 @@ const CAPTION_BY_STATE = Object.freeze({
   [ORB_STATES.SPEAKING]: "Speaking",
   [ORB_STATES.ERROR]: "Connection error",
 });
+const PRIVACY_CAPTION = "Privacy hat on · not listening";
 
 export async function mountTalkView({ outlet, signal }) {
   const pending = consumePendingApply();
@@ -38,6 +42,7 @@ export async function mountTalkView({ outlet, signal }) {
     return null;
   });
   let muted = false;
+  let privacy = false;
   let micReady = false;
   let togglePending = false;
   let activePersonality = null;
@@ -67,9 +72,10 @@ export async function mountTalkView({ outlet, signal }) {
   const orb = createOrb({
     initialState: ORB_STATES.CONNECTING,
     onStateChange: (state) => {
-      caption.textContent = CAPTION_BY_STATE[state] || "";
+      caption.textContent = captionFor(state);
     },
   });
+  const waves = createVoiceWaves({ anchor: orb.root });
   orb.root.disabled = true;
   orb.root.addEventListener("click", onMicTap);
   syncMicAria();
@@ -77,12 +83,24 @@ export async function mountTalkView({ outlet, signal }) {
   const stopWatchingPersonality = subscribe("conversation.personality", () => {
     void refreshPersonalityState();
   });
+  const stopWatchingLevel = subscribe("conversation.level", (params) => {
+    if (params?.role === "user") waves.setLevel(params.rms);
+  });
+  const stopWatchingPrivacy = subscribe("conversation.privacy", (params) => {
+    setPrivacy(Boolean(params?.active));
+  });
+  untilReady(getStatus, signal)
+    .then((status) => {
+      if (!signal.aborted) setPrivacy(Boolean(status?.privacy));
+    })
+    .catch(() => {});
 
   signal.addEventListener("abort", cleanup, { once: true });
 
   const view = h(
     "section",
     { class: "view view--talk" },
+    waves.root,
     h("div", { class: "talk__orb-wrap" }, orb.root),
     caption
   );
@@ -126,11 +144,11 @@ export async function mountTalkView({ outlet, signal }) {
       }
       if (signal.aborted) return;
       orb.setState(restingState());
-      caption.textContent = CAPTION_BY_STATE[restingState()];
+      caption.textContent = captionFor(restingState());
       syncMicAria();
     },
     onActivity: (reason) => {
-      if (muted) return;
+      if (muted || privacy) return;
       const next = mapActivityToState(reason);
       if (next == null) return;
       orb.setState(next);
@@ -140,6 +158,9 @@ export async function mountTalkView({ outlet, signal }) {
   function cleanup() {
     subscription?.close();
     orb.dispose();
+    waves.dispose();
+    stopWatchingLevel();
+    stopWatchingPrivacy();
     if (defaultAction) {
       defaultAction.hidden = true;
       defaultAction.removeEventListener("click", onSetDefault);
@@ -181,7 +202,22 @@ export async function mountTalkView({ outlet, signal }) {
   }
 
   function restingState() {
-    return muted ? ORB_STATES.MUTED : ORB_STATES.IDLE;
+    return muted || privacy ? ORB_STATES.MUTED : ORB_STATES.IDLE;
+  }
+
+  function captionFor(state) {
+    if (privacy && state === ORB_STATES.MUTED) return PRIVACY_CAPTION;
+    return CAPTION_BY_STATE[state] || "";
+  }
+
+  /** The robot neither hears nor answers while the privacy hat is on. */
+  function setPrivacy(next) {
+    if (next === privacy) return;
+    privacy = next;
+    waves.setFrozen(privacy);
+    if (!micReady) return;
+    orb.setState(restingState());
+    caption.textContent = captionFor(restingState());
   }
 
   async function onMicTap() {
@@ -201,7 +237,7 @@ export async function mountTalkView({ outlet, signal }) {
     if (signal.aborted) return;
     orb.setState(restingState());
     // setState skips unchanged states, so set the caption explicitly
-    caption.textContent = CAPTION_BY_STATE[restingState()];
+    caption.textContent = captionFor(restingState());
     syncMicAria();
   }
 

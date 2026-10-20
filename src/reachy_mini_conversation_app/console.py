@@ -137,6 +137,8 @@ class LocalStream:
         self._settings_initialized = False
         self._asyncio_loop = None
         self._mic_muted = False  # mic starts live; the UI toggles it via the settings API
+        # Set while the privacy hat is on the reader: nothing heard, nothing said.
+        self._privacy_active = False
         self._backend_connection_state = "not_started"
         self._backend_error: str | None = None
         self._backend_retry_delay = BACKEND_RETRY_DELAY_SECONDS
@@ -238,6 +240,28 @@ class LocalStream:
                 "conversation.personality",
                 {"profile": canonical_profile_name(profile)},
             )
+
+    def set_privacy(self, active: bool) -> None:
+        """Stop listening and answering while the privacy hat is on, or resume.
+
+        Called from the NFC polling thread.
+        """
+        if active == self._privacy_active:
+            return
+        self._privacy_active = active
+        logger.info("Privacy mode %s", "on" if active else "off")
+        loop = self._asyncio_loop
+        # Before the loop is up there is nothing to cut short, and clients read
+        # the mode from conversation.status.
+        if loop is None or not loop.is_running():
+            return
+        if active:
+            # Cut short whatever the robot was answering when the hat went on.
+            loop.call_soon_threadsafe(self.clear_audio_queue)
+            handler = cast("HuggingFaceRealtimeHandler", self.handler)
+            asyncio.run_coroutine_threadsafe(handler._cancel_responses(), loop)
+        if self._rpc is not None:
+            self._rpc.broadcast_threadsafe("conversation.privacy", {"active": active})
 
     def _emit_phase(self, phase: str, reason: Optional[str] = None) -> None:
         """Push a conversation.phase notification to JSON-RPC clients."""
@@ -566,6 +590,7 @@ class LocalStream:
             on_personality_applied=self.notify_personality,
             get_default_personality=self._read_persisted_personality,
             initial_personality=self._startup_accessory_personality,
+            on_privacy_changed=self.set_privacy,
         )
         register_rfid_methods(rpc, controller)
         self._rfid_controller = controller
@@ -625,6 +650,7 @@ class LocalStream:
                 "requires_restart": not self._can_rebuild_handler(),
                 **backend_connection,
                 **self._nfc_status(),
+                "privacy": self._privacy_active,
             }
 
         # GET / -> index.html
@@ -958,7 +984,7 @@ class LocalStream:
 
         while not self._stop_event.is_set():
             audio_frame = self._robot.media.get_audio_sample()
-            if audio_frame is not None and not self._mic_muted:
+            if audio_frame is not None and not self._mic_muted and not self._privacy_active:
                 await self.handler.receive((input_sample_rate, audio_frame))
                 self._emit_level("user", audio_frame)
             await asyncio.sleep(0)  # avoid busy loop
@@ -985,8 +1011,8 @@ class LocalStream:
             elif isinstance(handler_output, tuple):
                 _, audio_data = handler_output
 
-                # Skip empty audio frames
-                if audio_data.size == 0:
+                # Skip empty audio frames, and anything said despite the privacy hat
+                if audio_data.size == 0 or self._privacy_active:
                     continue
 
                 # Reshape if needed

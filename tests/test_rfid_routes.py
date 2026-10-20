@@ -375,3 +375,68 @@ def test_the_client_tells_an_unreadable_tag_apart(monkeypatch):
     assert not client.get_tag().readable
     body = {"present": True, "content": "hf_pirate"}
     assert client.get_tag().readable
+
+
+PRIVACY_HAT = _tag("hf-privacy-hat")
+
+
+@pytest.fixture
+def privacy(monkeypatch):
+    """Build a controller that records privacy changes and queued moves, without a handler or loop."""
+    monkeypatch.setattr(rfid_routes, "_load_move_dataset", lambda repo_id: None)
+    changes = []
+    moves = []
+    controller = rfid_routes.RfidController(
+        get_handler=lambda: _StubHandler(),
+        get_loop=lambda: None,
+        robot=None,
+        on_privacy_changed=changes.append,
+    )
+    monkeypatch.setattr(controller, "_queue_move", lambda handler, dataset, name: moves.append(name))
+    monkeypatch.setattr(controller, "_run_on_loop", lambda coro, description, **kw: True)
+    return controller, changes, moves
+
+
+def test_the_privacy_hat_is_described_as_such(controller, monkeypatch):
+    """Shown as unrecognized, the panel would offer to write a personality over it."""
+    fake_reader(monkeypatch, connected=True, tag=PRIVACY_HAT)
+    assert controller.snapshot()["accessory"]["state"] == "privacy"
+
+
+@pytest.mark.parametrize("content", ["hf-privacy-hat", "hf_privacy_hat", " HF-Privacy-Hat "])
+def test_putting_on_the_privacy_hat_plays_its_own_move_and_keeps_the_personality(privacy, content):
+    """The hat names no personality: it stops the listening, it does not switch."""
+    controller, changes, moves = privacy
+    controller._process([], ABSENT, _tag(content))
+    assert changes == [True]
+    assert moves == [rfid_routes.PRIVACY_MOVE_NAME]
+    assert controller._current_personality is None
+
+
+def test_taking_off_the_privacy_hat_listens_again(privacy):
+    """Nothing else marks the way back, so the usual transition move does."""
+    controller, changes, moves = privacy
+    controller._process([], ABSENT, PRIVACY_HAT)
+    controller._process([], PRIVACY_HAT, ABSENT)
+    assert changes == [True, False]
+    assert moves == [rfid_routes.PRIVACY_MOVE_NAME, rfid_routes.TRANSITION_MOVE_NAME]
+
+
+def test_a_privacy_hat_already_on_at_launch_is_honoured(privacy):
+    """The first read has nothing to compare with, but must not leave the robot listening."""
+    controller, changes, _moves = privacy
+    controller._process([], None, PRIVACY_HAT)
+    assert changes == [True]
+
+
+def test_swapping_the_privacy_hat_for_another_accessory_leaves_privacy(privacy, monkeypatch):
+    """Never read as a removal, the swap must still turn the listening back on."""
+    controller, changes, moves = privacy
+    monkeypatch.setattr(_StubHandler._Deps, "recently_written_codes", set(), raising=False)
+    monkeypatch.setattr(rfid_routes, "list_personalities", lambda: ["default", "pirate"])
+    controller._process([], ABSENT, PRIVACY_HAT)
+    controller._process([], PRIVACY_HAT, _tag("hf_pirate"))
+    assert changes == [True, False]
+    # The new accessory's own transition, not a second one for leaving privacy.
+    assert moves == [rfid_routes.PRIVACY_MOVE_NAME, rfid_routes.TRANSITION_MOVE_NAME]
+    assert controller._current_personality == "pirate"

@@ -15,6 +15,7 @@ const LABEL_BY_STATE = Object.freeze({
   blank: "Blank",
   known: "Linked",
   unknown: "Unrecognized",
+  privacy: "Privacy hat",
 });
 // What to show before the first answer, and whenever the reader cannot be read.
 const NO_READER = Object.freeze({ state: "unavailable", personality: null });

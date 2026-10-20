@@ -40,6 +40,10 @@ const ACCESSORY_COPY = Object.freeze({
     title: "Unrecognized accessory",
     hint: "This accessory carries something this robot cannot use — a personality it does not have, or a tag written elsewhere.",
   },
+  privacy: {
+    title: "Privacy hat",
+    hint: "Reachy Mini stops listening and does not answer while this hat is on its head.",
+  },
 });
 
 export async function mountAccessoryView({ outlet, signal }) {

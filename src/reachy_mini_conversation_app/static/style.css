@@ -818,6 +818,23 @@ button {
   gap: 20px;
 }
 
+/* Fixed behind the whole Talk view; the orb and caption sit above it. */
+.voice-waves {
+  --wave-color: #22d3ee;
+
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 0;
+  pointer-events: none;
+}
+
+.view--talk > :not(.voice-waves) {
+  position: relative;
+  z-index: 1;
+}
+
 .talk__orb-wrap {
   display: grid;
   place-items: center;

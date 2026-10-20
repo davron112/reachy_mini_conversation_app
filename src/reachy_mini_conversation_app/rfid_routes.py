@@ -5,6 +5,7 @@ one on the reader applies that personality, removing it reverts to the one this
 instance starts as — the personality set as default, or the built-in one.
 A blank accessory starts the "give it a personality" conversation, at the end of
 which :mod:`tools.create_accessory_personality` writes the new token onto it.
+The privacy hat names no personality: while it is on, the robot stops listening.
 
 The serial link is owned by the Reachy Mini daemon; this app is an HTTP client
 of the daemon's ``/api/nfc`` endpoints.
@@ -61,12 +62,18 @@ WRITE_MOVE_DATASET = "glannuzel/local-dataset"
 WRITE_MOVE_NAME = "write-tag-6"
 # The sound is started slightly before the movement is queued so the two line up.
 WRITE_SOUND_LEAD_S = 0.15
+PRIVACY_MOVE_DATASET = "glannuzel/local-dataset"
+PRIVACY_MOVE_NAME = "privacy-wake-up-1"
+# Written by hand rather than through the personality token scheme, so both
+# separators are accepted.
+PRIVACY_TAG_CONTENT = "hf-privacy-hat"
 ADD_ON_STORE_URL = "https://store.pollen-robotics.com/collections/reachy-mini"
 
 HandlerGetter = Callable[[], "HuggingFaceRealtimeHandler"]
 LoopGetter = Callable[[], asyncio.AbstractEventLoop | None]
 PersonalityObserver = Callable[[str | None], None]
 DefaultPersonalityGetter = Callable[[], str | None]
+PrivacyObserver = Callable[[bool], None]
 
 
 def accessory_personality_on_reader(timeout: float = 2.0) -> str | None:
@@ -83,6 +90,16 @@ def accessory_personality_on_reader(timeout: float = 2.0) -> str | None:
         return _tag_personality(client.get_tag())
     finally:
         client.close()
+
+
+def _is_privacy_code(code: str | None) -> bool:
+    """Return whether a tag's text is the privacy hat's."""
+    return (code or "").strip().lower().replace("_", "-") == PRIVACY_TAG_CONTENT
+
+
+def _is_privacy_tag(tag: NfcTagSnapshot) -> bool:
+    """Return whether the privacy hat is on the reader."""
+    return tag.present and not tag.blank and _is_privacy_code(tag.content)
 
 
 def _tag_personality(tag: NfcTagSnapshot) -> str | None:
@@ -136,13 +153,15 @@ class RfidController:
         on_personality_applied: PersonalityObserver | None = None,
         get_default_personality: DefaultPersonalityGetter | None = None,
         initial_personality: str | None = None,
+        on_privacy_changed: PrivacyObserver | None = None,
     ) -> None:
         """Build a controller; call :meth:`start` to begin polling.
 
         ``get_default_personality`` returns the personality to fall back to when
         the accessory is removed (the one set as default). ``initial_personality``
         is the one the app started as from an accessory already on the reader, so
-        that removing it is seen as a change.
+        that removing it is seen as a change. ``on_privacy_changed`` is told when
+        the privacy hat is put on (True) or taken off (False).
         """
         self._client = NfcDaemonClient()
         self._get_handler = get_handler
@@ -153,13 +172,16 @@ class RfidController:
         # badges would otherwise keep showing the one it replaced.
         self._on_personality_applied = on_personality_applied
         self._get_default_personality = get_default_personality
+        self._on_privacy_changed = on_privacy_changed
 
         self._transition_moves = _load_move_dataset(TRANSITION_MOVE_DATASET)
         self._write_moves = _load_move_dataset(WRITE_MOVE_DATASET)
+        self._privacy_moves = _load_move_dataset(PRIVACY_MOVE_DATASET)
 
         self._apply_lock = threading.Lock()
 
         self._current_personality: str | None = initial_personality
+        self._privacy_active = False
         self._blank_tag_active = False
         self._blank_tag_cooldown_until = 0.0
         self._delayed_switch_future: Any = None
@@ -228,6 +250,8 @@ class RfidController:
             return {"state": "unavailable", "personality": None, "content": None}
         if not tag.present:
             return {"state": "none", "personality": None, "content": None}
+        if _is_privacy_tag(tag):
+            return {"state": "privacy", "personality": None, "content": tag.content}
         if tag.blank or not tag.content:
             return {"state": "blank", "personality": None, "content": None}
         personality = _tag_personality(tag)
@@ -357,9 +381,15 @@ class RfidController:
         handler = self._get_handler()
         for success, code in write_results:
             self._on_write_result(handler, success, code)
-        # No previous read (first poll, or the reader just came back): nothing to compare.
+        # No previous read (first poll, or the reader just came back): nothing to
+        # compare, except that a privacy hat already on must still be honoured.
         if previous is None:
+            if _is_privacy_tag(tag):
+                self._enter_privacy(handler)
             return
+        if self._privacy_active and not _is_privacy_tag(tag):
+            # Swapped straight for another accessory: that one plays its own move.
+            self._leave_privacy(handler, play_move=not tag.present)
         if previous.present and not tag.present:
             self._on_tag_removed(handler)
         elif tag.present and not previous.present:
@@ -451,6 +481,9 @@ class RfidController:
             return
 
         handler.deps.blank_tag_present = False
+        if _is_privacy_code(code):
+            self._enter_privacy(handler)
+            return
         personality = from_tag_token(code)
         if personality is None or personality not in list_personalities():
             logger.info("[RFID] >>> tag %r names no personality on this robot, keeping current one", code)
@@ -473,6 +506,29 @@ class RfidController:
         self._current_personality = personality
         self._announce_personality(personality)
         logger.info("[RFID] >>> personality applied OK")
+
+    def _set_privacy(self, active: bool) -> None:
+        self._privacy_active = active
+        if self._on_privacy_changed is None:
+            return
+        try:
+            self._on_privacy_changed(active)
+        except Exception as exc:
+            logger.warning("[RFID] failed to announce the privacy mode: %s", exc)
+
+    def _enter_privacy(self, handler: "HuggingFaceRealtimeHandler") -> None:
+        """Stop listening while the privacy hat is on; the personality is left as it is."""
+        if self._privacy_active:
+            return
+        logger.info("[RFID] >>> privacy hat on — no longer listening")
+        self._set_privacy(True)
+        self._queue_move(handler, self._privacy_moves, PRIVACY_MOVE_NAME)
+
+    def _leave_privacy(self, handler: "HuggingFaceRealtimeHandler", play_move: bool) -> None:
+        logger.info("[RFID] >>> privacy hat off — listening again")
+        self._set_privacy(False)
+        if play_move:
+            self._queue_move(handler, self._transition_moves, TRANSITION_MOVE_NAME)
 
     def _on_blank_tag(self, handler: "HuggingFaceRealtimeHandler") -> None:
         handler.deps.blank_tag_present = True
