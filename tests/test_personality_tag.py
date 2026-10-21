@@ -1,4 +1,9 @@
-"""Round-trip and collision tests for the personality tag codec."""
+"""Round-trip and collision tests for the personality tag codec.
+
+The tag text is a contract shared with the mobile app, which reads and writes
+tags while this app is stopped (``src/features/nfc/accessory.ts`` there). Its
+tests use these same vectors: change both together.
+"""
 
 import pytest
 

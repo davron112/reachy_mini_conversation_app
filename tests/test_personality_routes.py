@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from reachy_mini.apps.jsonrpc_server import JsonRpcServer
 import reachy_mini_conversation_app.personality as personality_mod
+import reachy_mini_conversation_app.personality_routes as personality_routes
 from reachy_mini_conversation_app.config import DEFAULT_PROFILES_DIRECTORY, config
 from reachy_mini_conversation_app.profile_store import (
     write_profile,
@@ -265,6 +266,59 @@ def test_applying_default_persists_runtime_none(monkeypatch: pytest.MonkeyPatch)
 
     assert response["result"]["startup"] == "default"
     persist_personality.assert_called_once_with(None)
+
+
+def _set_default_client(persist_default: MagicMock, handler: MagicMock | None = None) -> TestClient:
+    app = FastAPI()
+    rpc = JsonRpcServer()
+    ops = build_personality_ops(
+        handler or MagicMock(),
+        lambda: None,
+        persist_personality=MagicMock(),
+        persist_default_personality=persist_default,
+    )
+    register_personality_methods(rpc, ops)
+    rpc.mount(app)
+    return TestClient(app)
+
+
+def test_set_default_saves_without_applying(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fallback personality is saved, the running one left alone."""
+    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "noir_detective")
+    monkeypatch.setattr(personality_routes, "list_personalities", lambda: ["noir_detective", "mars_rover"])
+    handler = MagicMock()
+    handler.apply_personality = AsyncMock()
+    persist_default = MagicMock()
+
+    response = _rpc_call(
+        _set_default_client(persist_default, handler), "personalities.set_default", {"name": "mars_rover"}
+    )
+
+    assert response["result"] == {"ok": True, "startup": "mars_rover"}
+    persist_default.assert_called_once_with("mars_rover")
+    handler.apply_personality.assert_not_awaited()
+    assert config.REACHY_MINI_CUSTOM_PROFILE == "noir_detective"
+
+
+def test_set_default_maps_default_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Like apply, the canonical default is stored as no custom profile."""
+    monkeypatch.setattr(personality_routes, "list_personalities", lambda: ["noir_detective"])
+    persist_default = MagicMock()
+
+    _rpc_call(_set_default_client(persist_default), "personalities.set_default", {"name": "default"})
+
+    persist_default.assert_called_once_with(None)
+
+
+def test_set_default_refuses_an_unknown_personality(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A name the robot does not have would leave nothing to fall back to."""
+    monkeypatch.setattr(personality_routes, "list_personalities", lambda: ["noir_detective"])
+    persist_default = MagicMock()
+
+    response = _rpc_call(_set_default_client(persist_default), "personalities.set_default", {"name": "missing"})
+
+    assert response["error"]["data"]["reason"] == "unknown_personality"
+    persist_default.assert_not_called()
 
 
 def test_force_reloads_active_personality(monkeypatch: pytest.MonkeyPatch) -> None:

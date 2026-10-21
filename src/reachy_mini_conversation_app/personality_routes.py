@@ -64,6 +64,7 @@ class PersonalityOps:
         get_loop: Callable[[], asyncio.AbstractEventLoop | None],
         *,
         persist_personality: Callable[[str | None], None] | None = None,
+        persist_default_personality: Callable[[str | None], None] | None = None,
         get_persisted_personality: Callable[[], str | None] | None = None,
         apply_personality: Callable[[str | None], Awaitable[str]] | None = None,
         get_voices: Callable[[], Awaitable[list[str]]] | None = None,
@@ -75,6 +76,7 @@ class PersonalityOps:
         self._handler = handler
         self._get_loop = get_loop
         self._persist_personality = persist_personality
+        self._persist_default_personality = persist_default_personality
         self._get_persisted_personality = get_persisted_personality
         self._apply_personality = apply_personality
         self._get_voices = get_voices
@@ -240,6 +242,27 @@ class PersonalityOps:
             raise RouteError("not_deletable", extra={"choices": choices})
         return {"ok": True, "choices": list_personalities()}
 
+    def set_default(self, name: str) -> dict[str, Any]:
+        """Save the personality to start with and to fall back to when an accessory comes off, without applying it.
+
+        For a client that follows an accessory on the reader while the app is stopped:
+        the accessory's personality is the one to run, the one from before it the default.
+        """
+        if LOCKED_PROFILE is not None:
+            raise RouteError("profile_locked", extra={"locked_to": LOCKED_PROFILE})
+        selected_name = canonical_profile_name(name)
+        choices = list_personalities()
+        if selected_name != DEFAULT_PROFILE_NAME and selected_name not in choices:
+            raise RouteError("unknown_personality", extra={"choices": choices})
+        if self._persist_default_personality is None:
+            raise RouteError("default_unavailable")
+        try:
+            self._persist_default_personality(None if selected_name == DEFAULT_PROFILE_NAME else selected_name)
+        except Exception as exc:
+            raise RouteError("default_save_failed", message=str(exc)) from exc
+        self._set_startup_choice(selected_name)
+        return {"ok": True, "startup": self._startup_choice_value()}
+
     async def apply(self, name: str, persist: bool = False, *, force: bool = False) -> dict[str, Any]:
         """Apply or reload a personality and optionally persist it for startup."""
         if LOCKED_PROFILE is not None:
@@ -347,6 +370,7 @@ def build_personality_ops(
     get_loop: Callable[[], asyncio.AbstractEventLoop | None],
     *,
     persist_personality: Callable[[str | None], None] | None = None,
+    persist_default_personality: Callable[[str | None], None] | None = None,
     get_persisted_personality: Callable[[], str | None] | None = None,
     apply_personality: Callable[[str | None], Awaitable[str]] | None = None,
     get_voices: Callable[[], Awaitable[list[str]]] | None = None,
@@ -359,6 +383,7 @@ def build_personality_ops(
         handler,
         get_loop,
         persist_personality=persist_personality,
+        persist_default_personality=persist_default_personality,
         get_persisted_personality=get_persisted_personality,
         apply_personality=apply_personality,
         get_voices=get_voices,
@@ -404,6 +429,7 @@ def register_personality_methods(rpc: JsonRpcServer, ops: PersonalityOps) -> Non
             )
         ),
     )
+    rpc.register("personalities.set_default", _wrap(lambda params: ops.set_default(str(params.get("name", "")))))
     rpc.register("voices.list", _wrap(lambda params: ops.voices()))
     rpc.register("voices.current", _wrap(lambda params: ops.current_voice()))
     rpc.register("voices.apply", _wrap(lambda params: ops.apply_voice(str(params.get("voice", "")))))

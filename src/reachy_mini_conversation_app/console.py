@@ -463,7 +463,16 @@ class LocalStream:
             return
         selection = (profile or "").strip() or None
         set_custom_profile(selection)
+        self._write_startup_personality(selection)
 
+    def _persist_default_personality(self, profile: Optional[str]) -> None:
+        """Save the startup personality without making it the running one."""
+        if LOCKED_PROFILE is not None:
+            return
+        self._write_startup_personality((profile or "").strip() or None)
+
+    def _write_startup_personality(self, selection: Optional[str]) -> None:
+        """Write the startup personality to instance-local UI settings."""
         if not self._instance_path:
             return
         try:
@@ -761,6 +770,7 @@ class LocalStream:
                 self.handler,
                 lambda: self._asyncio_loop,
                 persist_personality=self._persist_personality,
+                persist_default_personality=self._persist_default_personality,
                 get_persisted_personality=self._read_persisted_personality,
                 apply_personality=self.apply_personality,
                 get_voices=self.get_available_voices,
