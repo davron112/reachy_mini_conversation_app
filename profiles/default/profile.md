@@ -13,9 +13,13 @@ default_tools = [
   "remember",
   "forget",
   "head_tracking",
+  "volume_control",
+  "robot_status",
   "pollen_robotics_reachy_mini_search_tool__search_web",
   "pollen_robotics_reachy_mini_weather_tool__get_weather",
   "pollen_robotics_reachy_mini_time_tool__get_time",
+  "pollen_robotics_reachy_mini_knowledge_tool__get_info",
+  "pollen_robotics_reachy_mini_knowledge_tool__search_docs",
 ]
 +++
 

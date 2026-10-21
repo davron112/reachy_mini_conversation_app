@@ -14,6 +14,8 @@ import {
   subscribe,
   untilReady,
 } from "../api.js";
+import { createConversationPanel } from "../components/conversation-panel.js";
+import { createLanguagePicker } from "../components/language-picker.js";
 import { ORB_STATES } from "../constants.js";
 import { createOrb, mapActivityToState } from "../orb.js";
 import { consumePendingApply } from "../pending-apply.js";
@@ -64,6 +66,16 @@ export async function mountTalkView({ outlet, signal }) {
       syncLinkAction();
     });
   }
+  const languageRoot = document.querySelector('[data-component="language-picker"]');
+  const languagePicker = languageRoot
+    ? createLanguagePicker({
+        root: languageRoot,
+        signal,
+        onStatus: (message) => {
+          caption.textContent = message;
+        },
+      })
+    : null;
   const orb = createOrb({
     initialState: ORB_STATES.CONNECTING,
     onStateChange: (state) => {
@@ -73,6 +85,10 @@ export async function mountTalkView({ outlet, signal }) {
   orb.root.disabled = true;
   orb.root.addEventListener("click", onMicTap);
   syncMicAria();
+  const conversationPanel = createConversationPanel({
+    toggle: document.querySelector('[data-component="conversation-toggle"]'),
+    signal,
+  });
 
   const stopWatchingPersonality = subscribe("conversation.personality", () => {
     void refreshPersonalityState();
@@ -83,8 +99,8 @@ export async function mountTalkView({ outlet, signal }) {
   const view = h(
     "section",
     { class: "view view--talk" },
-    h("div", { class: "talk__orb-wrap" }, orb.root),
-    caption
+    h("div", { class: "talk__stage" }, h("div", { class: "talk__orb-wrap" }, orb.root), caption),
+    conversationPanel.root
   );
   outlet.replaceChildren(view);
 
@@ -139,6 +155,7 @@ export async function mountTalkView({ outlet, signal }) {
 
   function cleanup() {
     subscription?.close();
+    conversationPanel.dispose();
     orb.dispose();
     if (defaultAction) {
       defaultAction.hidden = true;
@@ -206,6 +223,8 @@ export async function mountTalkView({ outlet, signal }) {
   }
 
   async function refreshPersonalityState() {
+    // The language can be saved per personality, so it follows the active one.
+    void languagePicker?.refresh();
     const personalityState = await fetchPersonalityState(signal);
     if (signal.aborted || personalityState == null) return;
     activePersonality = personalityState.current;

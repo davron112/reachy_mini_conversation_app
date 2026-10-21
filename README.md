@@ -36,7 +36,7 @@ Conversational app for the Reachy Mini robot combining realtime voice, vision, p
 - Low-latency audio conversation through the Hugging Face realtime backend, using the built-in server or a local endpoint.
 - Vision is handled by the realtime backend when the `camera` tool is used.
 - Layered motion system queues primary moves (dances, emotions, goto poses, breathing) while blending speech-reactive wobble.
-- Async tools integrate motion, camera capture, and MCP Tool Spaces. The optional web UI (`--ui`) manages conversations, personalities, tools, and settings.
+- Async tools integrate motion, camera capture, and MCP Tool Spaces. The optional web UI (`--ui`) manages conversations, personalities, tools, and settings, and its Talk view can show the live transcript. The backend's per-turn latencies appear there when **Settings → Developer options → Show response latencies** is on; the choice is saved across launches.
 
 ## Architecture
 
@@ -102,11 +102,28 @@ Copy `.env.example` to `.env` when you want to point Hugging Face at your own lo
 
 | Variable | Description |
 |----------|-------------|
-| `REALTIME_TRANSCRIPTION_LANGUAGE` | Optional input transcription language for the realtime backend. Defaults to `en`; set to a backend-supported code such as `zh` for Chinese. |
+| `REALTIME_TRANSCRIPTION_LANGUAGE` | Conversation language for every personality. Defaults to `auto` for automatic language detection; set to a backend-supported code such as `en` for English or `zh` for Chinese to fix the language. A fixed language forces speech recognition and synthesis, and the model is told to greet and answer in it. |
+| `LOCAL_BARGE_IN_ENABLED` | Local audio interruption. Defaults to `true`; requires `LOCAL_VAD_ENABLED=true`. |
+| `LOCAL_VAD_ENABLED` | Local Silero speech detection for faster physical listening reactions. Defaults to `true`; set to `false` to use server VAD alone for movement. |
 | `HF_REALTIME_CONNECTION_MODE` | Hugging Face connection selector: `deployed` uses the built-in Hugging Face server; `local` uses `HF_REALTIME_WS_URL`. Defaults to `deployed`. |
 | `HF_REALTIME_WS_URL` | Direct websocket endpoint for your own Hugging Face backend. Accepts either a base URL like `ws://127.0.0.1:8765/v1` or the full websocket URL `ws://127.0.0.1:8765/v1/realtime`. Used when `HF_REALTIME_CONNECTION_MODE=local`. |
 | `HF_TOKEN` | Optional token for Hugging Face access. Local endpoints receive only this explicitly configured token. |
 | `REACHY_MINI_APP_TIMEOUT_MINUTES` | Minutes of inactivity before Reachy goes to sleep and the app stops. Defaults to `1440` (one day); set to `0` to disable. |
+| `REACHY_MINI_INSTANCE_PATH` | Directory for this instance's data: long-term memory, user personalities and settings. Defaults to `conversation_app` beside the daemon's own config (`~/.config/reachy_mini` on Linux). Data written by an older version inside the installed package is copied over once. |
+| `REACHY_MINI_MEMORY_ENABLED` | Long-term memory. When `false`, remembered facts stay on disk but are not injected into the prompt, and the `remember` / `forget` tools decline. Defaults to `true`. |
+| `REACHY_MINI_CAMERA_ENABLED` | Camera tool. `--no-camera` forces it off regardless. Defaults to `true`. |
+
+These variables are the starting value. What you change through the settings UI
+(or from the mobile app) is written to `settings.json` in the instance directory
+and wins over them, so a toggle always does what it says.
+
+Pick the conversation language with the flag button next to the personality on the Talk view. **Save for** chooses between the active personality only and all personalities; saving for all also clears the languages saved for single personalities. A personality's own language wins over the shared one and applies from the startup greeting on, so switching personality switches the language with it. Saving reconnects the conversation, and Reachy greets you again in the new language.
+
+`LOCAL_VAD_ENABLED` defaults to `true`. Change **Local speech detection** in the gear-wheel **Settings → Speech behavior** view. Saved choices take precedence over environment defaults and persist across launches; saving reconnects the conversation to apply the change. Local Silero VAD and server VAD both control physical listening: either detector freezes the antennas and suppresses idle movement. Movement resumes smoothly once both report silence. Local detection holds through 400 ms of silence and clears after 500 ms without microphone frames. Model history clears after each completed speech segment and after 500 ms of consecutive low-confidence idle audio (512 ms at the 32 ms inference cadence). These resets preserve pending microphone samples and context during speech and within-segment pauses. It uses the SDK's 16 kHz microphone audio; conversation turns continue to use server VAD. If local detection fails, the app logs a warning and uses server VAD alone.
+
+Local barge-in defaults to enabled. Change **Local barge-in** in **Settings → Speech behavior**, or set `LOCAL_BARGE_IN_ENABLED=false` to disable it when no saved preference exists. It requires local speech detection; disabling that switch also disables local interruption while preserving the saved barge-in preference. While audio is buffered or being submitted for playback (plus a 100 ms trailing margin), a Silero speech candidate lowers upcoming playback to 25% amplitude. Playback only stops once server VAD confirms the user turn, so loud background speech ducks the robot without dropping its answer; late audio from the interrupted response is discarded. A rejected candidate restores normal volume after 64 ms of silence. Server interruptions remain enabled, and microphone audio continues streaming to the backend. Playback is fed to the SDK in paced 20 ms chunks; already-submitted audio and SDK/transport latency delay audible volume changes. This is experimental: speaker echo, motor noise, audible latency and CPU overhead still need robot testing. With `--debug`, open `/static/vad-monitor.html` on the app settings server for a read-only live monitor with completed user and robot transcripts. The transcript view keeps the last 100 turns received while the page is open and clears on refresh. The `/rpc` WebSocket emits `conversation.vad` diagnostics with a Unix timestamp, the latest Silero speech probability, local/server/combined listening states, barge-in candidate and playback gain. Probability updates are limited to 10 Hz; state changes are reported immediately. Diagnostics reuse existing inference and do not change the inactivity timer.
+
+On the first startup with local VAD enabled, the app downloads the [Silero VAD v6.2.1 model and MIT license](https://github.com/snakers4/silero-vad/tree/v6.2.1) directly from the pinned upstream commit and verifies their SHA-256 checksums. They are stored in the Hugging Face assets cache (`HF_HOME/assets`, or `HF_ASSETS_CACHE` when set), like the cached emotion recordings. Later starts reuse the files without a network request. The model runs on CPU with ONNX Runtime. If the download or model load fails, the app logs a warning and continues with server VAD alone.
 
 ### Hugging Face Connection Modes
 
@@ -200,9 +217,13 @@ Every bundled profile enables `head_tracking` by default; users can still disabl
 | `sweep_look` | Sweep Reachy's head left, right, and back to center. | Shared tool, enabled by default in the default profile. |
 | `remember` | Save one short, stable fact about the user for future sessions. | Core install only. Stored in the app instance data directory. |
 | `forget` | Remove a saved memory fact by matching a short query. | Core install only. |
+| `volume_control` | Read or change Reachy's speaker or microphone volume. | Core install only. Uses the daemon REST API; setting the speaker volume plays a short confirmation sound. |
+| `robot_status` | Read one status topic: `name`, `software` (version, update available), `wifi` (IP address, network), `account` (Hugging Face sign-in), `imu` (which way the head is tilted, motion, temperature), `apps` (installed apps). | Core install only. Uses the daemon REST API. The update check and the Wi-Fi network details are wireless-version only; the IP address is reported on any robot. |
 | `pollen_robotics_reachy_mini_search_tool__search_web` | Search the web and return a short list of results. | Preinstalled MCP Space: `pollen-robotics/reachy-mini-search-tool`. |
 | `pollen_robotics_reachy_mini_weather_tool__get_weather` | Report today's weather for a place: current conditions, high and low temperature, and rain chance. | Preinstalled MCP Space: `pollen-robotics/reachy-mini-weather-tool`. |
 | `pollen_robotics_reachy_mini_time_tool__get_time` | Report the current time for a timezone or the user's local time, or the difference between two timezones. | Preinstalled MCP Space: `pollen-robotics/reachy-mini-time-tool`. |
+| `pollen_robotics_reachy_mini_knowledge_tool__get_info` | Read the official overview, capabilities, versions, and prices for a Pollen Robotics product or the company. | Preinstalled MCP Space: `pollen-robotics/reachy-mini-knowledge-tool`. |
+| `pollen_robotics_reachy_mini_knowledge_tool__search_docs` | Search the official Reachy Mini FAQ and troubleshooting documentation. | Preinstalled MCP Space: `pollen-robotics/reachy-mini-knowledge-tool`. |
 
 > [!NOTE]
 > `remember`/`forget` facts are stored in `memory.v1.json` inside the app's instance data directory (`~/.local/share/reachy_mini_conversation_app/` by default, or the instance path used by the desktop launcher). `forget` only removes facts matched by query. To reset all remembered facts, delete this file.
@@ -368,7 +389,7 @@ reachy-mini-conversation-app tool-spaces list
 reachy-mini-conversation-app tool-spaces remove owner/space-name
 ```
 
-Bundled Pollen Spaces use static specs and are enabled by the default profile. Custom Spaces are validated through the Hugging Face Hub; HF tokens are sent only to private Spaces. Tool metadata is cached in:
+Bundled Pollen Spaces use static specs and are enabled by the default profile. Newly bundled Spaces are added to existing installations without restoring older tools the user removed. Custom Spaces are validated through the Hugging Face Hub; HF tokens are sent only to private Spaces. Tool metadata is cached in:
 
 - `installed_tool_spaces.json` in the managed app instance directory
 - `external_content/installed_tool_spaces.json` in terminal mode

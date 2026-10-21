@@ -43,8 +43,9 @@ function connect() {
       }
       pending.clear();
       if (!opened) reject(new RpcError("cannot reach /rpc", "disconnected"));
-      // Keep the event stream alive across drops while anyone is listening.
-      else if (subscribers.size > 0) setTimeout(() => connect().catch(() => {}), 1000);
+      // Keep the event stream alive while anyone is listening, across drops and
+      // when the page loads before the app has mounted /rpc.
+      if (subscribers.size > 0) setTimeout(() => connect().catch(() => {}), 1000);
     };
   });
   return connecting;
@@ -99,7 +100,9 @@ export function subscribe(method, cb) {
   set.add(cb);
   connect().catch(() => {});
   return () => {
-    subscribers.get(method)?.delete(cb);
+    const current = subscribers.get(method);
+    current?.delete(cb);
+    if (current?.size === 0) subscribers.delete(method);
   };
 }
 
@@ -134,6 +137,7 @@ export const applyPersonality = (name, { persist = false, force = false } = {}) 
   rpcCall("personalities.apply", { name, persist, force });
 export const deletePersonality = (name) => rpcCall("personalities.delete", { name });
 
+export const getConversationHistory = () => rpcCall("conversation.history");
 export const getMicState = () => rpcCall("conversation.mic", {});
 export const setMicMuted = (muted) => rpcCall("conversation.mic", { muted });
 
@@ -142,7 +146,12 @@ export const getCurrentVoice = () => rpcCall("voices.current");
 export const applyVoice = (voice) => rpcCall("voices.apply", { voice });
 export const saveVoice = (voice) => rpcCall("voices.save", { voice });
 
+export const getLanguage = () => rpcCall("language.get");
+/** scope: "profile" saves for the active personality only, "all" for every personality. */
+export const setLanguage = (language, scope) => rpcCall("language.set", { language, scope });
+
 export const saveBackendConfig = (payload) => rpcCall("backend.config", payload);
+export const saveSpeechConfig = (payload) => rpcCall("speech.config", payload);
 
 export const listToolSpaces = () => rpcCall("tool_spaces.list");
 export const addToolSpace = (slug) =>
