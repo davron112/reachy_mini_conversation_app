@@ -55,6 +55,10 @@ DISCONNECTED_POLL_INTERVAL_S = 2.0
 # A tag briefly reading NO_TAG (a hand moving it, a marginal antenna position)
 # must not re-trigger the blank-tag conversation as soon as it reads again.
 BLANK_TAG_COOLDOWN_S = 3.0
+# How long a poll waits for a personality switch before moving on. Restarting
+# the voice session allocates a new one and gives it 5 s more to connect, so a
+# switch can take longer: it is then announced once it lands.
+PERSONALITY_APPLY_WAIT_S = 10.0
 TRANSITION_MOVE_DATASET = "cdeplanne/local-dataset"
 TRANSITION_MOVE_NAME = "switch-personnality-5"
 WRITE_MOVE_DATASET = "glannuzel/local-dataset"
@@ -160,6 +164,9 @@ class RfidController:
         self._apply_lock = threading.Lock()
 
         self._current_personality: str | None = initial_personality
+        # Bumped by every personality switch, so one that lands after a newer
+        # one was asked for is not announced over it.
+        self._apply_generation = 0
         self._blank_tag_active = False
         self._blank_tag_cooldown_until = 0.0
         self._delayed_switch_future: Any = None
@@ -392,6 +399,65 @@ class RfidController:
             logger.warning("[RFID] >>> %s FAILED: %s", description, exc)
             return False
 
+    def _switch_personality(
+        self,
+        handler: "HuggingFaceRealtimeHandler",
+        profile: str | None,
+        accessory_personality: str | None,
+        description: str,
+    ) -> None:
+        """Apply ``profile`` on the conversation loop and announce it once it is in effect.
+
+        ``accessory_personality`` is what the reader is on afterwards: the
+        accessory's personality, or None once it reverts to the default. It is
+        recorded before the switch lands, so an accessory taken off meanwhile
+        still reverts it. A switch outlasting the wait keeps going on the loop
+        (it does take effect), and is announced when it lands, unless a newer
+        switch was asked for in between.
+        """
+        loop = self._get_loop()
+        coroutine = handler.apply_personality(profile)
+        if loop is None:
+            coroutine.close()
+            return
+        self._apply_generation += 1
+        generation = self._apply_generation
+        previous = self._current_personality
+        self._current_personality = accessory_personality
+
+        def landed() -> None:
+            if generation != self._apply_generation:
+                logger.info("[RFID] >>> %s landed after a newer switch, not announced", description)
+                return
+            self._announce_personality(profile)
+            logger.info("[RFID] >>> %s OK", description)
+
+        def failed(exc: BaseException) -> None:
+            logger.warning("[RFID] >>> %s FAILED: %s", description, exc)
+            if generation == self._apply_generation:
+                self._current_personality = previous
+
+        future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        try:
+            future.result(timeout=PERSONALITY_APPLY_WAIT_S)
+        except TimeoutError:
+            logger.info("[RFID] >>> %s still running, announcing it once it lands", description)
+
+            def done(f: Any) -> None:
+                if f.cancelled():
+                    failed(RuntimeError("cancelled"))
+                elif f.exception() is not None:
+                    failed(f.exception())
+                else:
+                    landed()
+
+            future.add_done_callback(done)
+            return
+        except Exception as exc:
+            failed(exc)
+            return
+        landed()
+
     def _on_tag_removed(self, handler: "HuggingFaceRealtimeHandler") -> None:
         was_blank = self._blank_tag_active
         self._blank_tag_active = False
@@ -422,11 +488,7 @@ class RfidController:
 
         logger.info("[RFID] >>> NO_TAG received — reverting to %s", profile or DEFAULT_PROFILE_NAME)
         self._queue_move(handler, self._transition_moves, TRANSITION_MOVE_NAME)
-        if not self._run_on_loop(handler.apply_personality(profile), "default revert"):
-            return
-        self._current_personality = None
-        self._announce_personality(profile)
-        logger.info("[RFID] >>> default personality applied OK")
+        self._switch_personality(handler, profile, None, "default revert")
 
     def _default_personality(self) -> str | None:
         """Return the personality to fall back to with no accessory on the reader.
@@ -468,11 +530,7 @@ class RfidController:
 
         logger.info("[RFID] >>> applying personality %r for code %r", personality, code)
         self._queue_move(handler, self._transition_moves, TRANSITION_MOVE_NAME)
-        if not self._run_on_loop(handler.apply_personality(personality), "apply"):
-            return
-        self._current_personality = personality
-        self._announce_personality(personality)
-        logger.info("[RFID] >>> personality applied OK")
+        self._switch_personality(handler, personality, personality, "apply")
 
     def _on_blank_tag(self, handler: "HuggingFaceRealtimeHandler") -> None:
         handler.deps.blank_tag_present = True

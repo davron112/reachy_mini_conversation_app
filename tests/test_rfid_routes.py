@@ -1,5 +1,7 @@
 """What the reader reports for the UI: no reader is not the same as no accessory."""
 
+import asyncio
+import threading
 import webbrowser
 
 import pytest
@@ -150,24 +152,42 @@ def test_a_robot_without_the_nfc_driver_is_not_asked_for_a_tag(monkeypatch):
 
 
 class _StubHandler:
-    """Just enough handler for the tag-removal path, which never reaches the loop."""
+    """Just enough handler for the tag paths: switches run on the test loop, taking ``delay``."""
 
     class _Deps:
         blank_tag_present = False
         pending_nfc_write = None
+        recently_written_codes: set = set()
 
-    def __init__(self):
+    def __init__(self, delay=0.0):
         self.deps = self._Deps()
+        self.deps.recently_written_codes = set()
+        self.applied = []
+        self._delay = delay
 
     def abort_nfc_collection(self):
         return None
 
-    def apply_personality(self, profile):
-        return None
+    async def apply_personality(self, profile):
+        await asyncio.sleep(self._delay)
+        self.applied.append(profile)
+        return "ok"
 
 
-def removal_controller(monkeypatch, *, initial_personality=None, default_personality=None):
-    """Build a controller whose revert is observable without a handler or a loop.
+@pytest.fixture
+def conversation_loop():
+    """A running event loop on its own thread, standing in for the conversation loop."""
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    yield loop
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=2)
+    loop.close()
+
+
+def removal_controller(monkeypatch, conversation_loop, *, initial_personality=None, default_personality=None):
+    """Build a controller whose switches run on a real loop, without a handler.
 
     Returns the controller and the list of personalities it announced.
     """
@@ -175,7 +195,7 @@ def removal_controller(monkeypatch, *, initial_personality=None, default_persona
     announced = []
     controller = rfid_routes.RfidController(
         get_handler=lambda: pytest.fail("the handler is passed in, not fetched"),
-        get_loop=lambda: None,
+        get_loop=lambda: conversation_loop,
         robot=None,
         on_personality_applied=announced.append,
         get_default_personality=lambda: default_personality,
@@ -186,19 +206,19 @@ def removal_controller(monkeypatch, *, initial_personality=None, default_persona
     return controller, announced
 
 
-def test_taking_off_the_accessory_the_app_started_with_reverts_to_the_default(monkeypatch):
+def test_taking_off_the_accessory_the_app_started_with_reverts_to_the_default(monkeypatch, conversation_loop):
     """The controller applied nothing itself, so it has to be told what it started as."""
-    controller, announced = removal_controller(monkeypatch, initial_personality="pirate")
+    controller, announced = removal_controller(monkeypatch, conversation_loop, initial_personality="pirate")
 
     controller._on_tag_removed(_StubHandler())
 
     assert announced == [None]
 
 
-def test_taking_off_an_accessory_goes_back_to_the_personality_set_as_default(monkeypatch):
+def test_taking_off_an_accessory_goes_back_to_the_personality_set_as_default(monkeypatch, conversation_loop):
     """The fallback is whatever this instance was told to start as, not the built-in one."""
     controller, announced = removal_controller(
-        monkeypatch, initial_personality="pirate", default_personality="king_reachy_maximus"
+        monkeypatch, conversation_loop, initial_personality="pirate", default_personality="king_reachy_maximus"
     )
     monkeypatch.setattr(rfid_routes, "list_personalities", lambda: ["default", "king_reachy_maximus", "pirate"])
 
@@ -207,10 +227,10 @@ def test_taking_off_an_accessory_goes_back_to_the_personality_set_as_default(mon
     assert announced == ["king_reachy_maximus"]
 
 
-def test_a_default_personality_since_deleted_falls_back_to_the_built_in_one(monkeypatch):
+def test_a_default_personality_since_deleted_falls_back_to_the_built_in_one(monkeypatch, conversation_loop):
     """Reverting to a personality this robot no longer has would fail and strand the accessory's."""
     controller, announced = removal_controller(
-        monkeypatch, initial_personality="pirate", default_personality="deleted_since"
+        monkeypatch, conversation_loop, initial_personality="pirate", default_personality="deleted_since"
     )
     monkeypatch.setattr(rfid_routes, "list_personalities", lambda: ["default", "pirate"])
 
@@ -219,10 +239,13 @@ def test_a_default_personality_since_deleted_falls_back_to_the_built_in_one(monk
     assert announced == [None]
 
 
-def test_an_accessory_carrying_the_default_personality_changes_nothing_when_removed(monkeypatch):
+def test_an_accessory_carrying_the_default_personality_changes_nothing_when_removed(monkeypatch, conversation_loop):
     """Restarting the backend to arrive at what is already running only costs a silence."""
     controller, announced = removal_controller(
-        monkeypatch, initial_personality="king_reachy_maximus", default_personality="king_reachy_maximus"
+        monkeypatch,
+        conversation_loop,
+        initial_personality="king_reachy_maximus",
+        default_personality="king_reachy_maximus",
     )
     monkeypatch.setattr(rfid_routes, "list_personalities", lambda: ["default", "king_reachy_maximus"])
 
@@ -231,13 +254,44 @@ def test_an_accessory_carrying_the_default_personality_changes_nothing_when_remo
     assert announced == []
 
 
-def test_a_controller_that_started_at_the_default_has_nothing_to_revert(monkeypatch):
+def test_a_controller_that_started_at_the_default_has_nothing_to_revert(monkeypatch, conversation_loop):
     """No accessory at launch: taking nothing off must not restart the backend."""
-    controller, announced = removal_controller(monkeypatch)
+    controller, announced = removal_controller(monkeypatch, conversation_loop)
 
     controller._on_tag_removed(_StubHandler())
 
     assert announced == []
+
+
+def test_a_switch_outlasting_the_wait_is_announced_once_it_lands(monkeypatch, conversation_loop):
+    """Restarting the voice session can take longer than a poll waits: the switch still lands."""
+    monkeypatch.setattr(rfid_routes, "PERSONALITY_APPLY_WAIT_S", 0.05)
+    monkeypatch.setattr(rfid_routes, "list_personalities", lambda: ["default", "pirate"])
+    controller, announced = removal_controller(monkeypatch, conversation_loop)
+    handler = _StubHandler(delay=0.3)
+
+    controller._on_tag_read(handler, to_tag_token("pirate"))
+    assert announced == []
+    # Taking the accessory off meanwhile still reverts it: the switch was recorded.
+    assert controller._current_personality == "pirate"
+
+    asyncio.run_coroutine_threadsafe(asyncio.sleep(0.5), conversation_loop).result(timeout=2)
+    assert announced == ["pirate"]
+
+
+def test_a_slow_switch_overtaken_by_a_newer_one_is_not_announced(monkeypatch, conversation_loop):
+    """An accessory taken off before its personality landed must not have the last word."""
+    monkeypatch.setattr(rfid_routes, "PERSONALITY_APPLY_WAIT_S", 0.05)
+    monkeypatch.setattr(rfid_routes, "list_personalities", lambda: ["default", "pirate"])
+    controller, announced = removal_controller(monkeypatch, conversation_loop)
+    handler = _StubHandler(delay=0.3)
+
+    controller._on_tag_read(handler, to_tag_token("pirate"))
+    controller._on_tag_removed(handler)
+
+    asyncio.run_coroutine_threadsafe(asyncio.sleep(0.5), conversation_loop).result(timeout=2)
+    assert announced == [None]
+    assert controller._current_personality is None
 
 
 def _tag(content=None, *, blank=False):
