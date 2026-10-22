@@ -406,31 +406,42 @@ class RfidController:
         accessory_personality: str | None,
         description: str,
     ) -> None:
-        """Apply ``profile`` on the conversation loop and announce it once it is in effect.
+        """Apply ``profile`` on the conversation loop and announce it as soon as it is in effect.
+
+        The handler reports that (``on_applied``) before restarting the voice
+        session, which can take several seconds more: clients are told when the
+        robot starts speaking as the new personality, not after the restart.
 
         ``accessory_personality`` is what the reader is on afterwards: the
         accessory's personality, or None once it reverts to the default. It is
         recorded before the switch lands, so an accessory taken off meanwhile
         still reverts it. A switch outlasting the wait keeps going on the loop
-        (it does take effect), and is announced when it lands, unless a newer
-        switch was asked for in between.
+        (it does take effect); one overtaken by a newer switch is not announced.
         """
         loop = self._get_loop()
-        coroutine = handler.apply_personality(profile)
         if loop is None:
-            coroutine.close()
             return
         self._apply_generation += 1
         generation = self._apply_generation
         previous = self._current_personality
         self._current_personality = accessory_personality
+        applied = threading.Event()
 
         def landed() -> None:
+            # Runs on the conversation loop, from inside apply_personality.
+            applied.set()
             if generation != self._apply_generation:
                 logger.info("[RFID] >>> %s landed after a newer switch, not announced", description)
                 return
             self._announce_personality(profile)
             logger.info("[RFID] >>> %s OK", description)
+
+        def finished() -> None:
+            # A personality that could not be loaded leaves the previous one running.
+            if not applied.is_set():
+                failed(RuntimeError("the personality could not be loaded"))
+
+        coroutine = handler.apply_personality(profile, on_applied=landed)
 
         def failed(exc: BaseException) -> None:
             logger.warning("[RFID] >>> %s FAILED: %s", description, exc)
@@ -449,14 +460,14 @@ class RfidController:
                 elif f.exception() is not None:
                     failed(f.exception())
                 else:
-                    landed()
+                    finished()
 
             future.add_done_callback(done)
             return
         except Exception as exc:
             failed(exc)
             return
-        landed()
+        finished()
 
     def _on_tag_removed(self, handler: "HuggingFaceRealtimeHandler") -> None:
         was_blank = self._blank_tag_active

@@ -168,9 +168,12 @@ class _StubHandler:
     def abort_nfc_collection(self):
         return None
 
-    async def apply_personality(self, profile):
-        await asyncio.sleep(self._delay)
+    async def apply_personality(self, profile, on_applied=None):
+        # Like the real handler: in effect at once, then a slow session restart.
         self.applied.append(profile)
+        if on_applied is not None:
+            on_applied()
+        await asyncio.sleep(self._delay)
         return "ok"
 
 
@@ -263,24 +266,24 @@ def test_a_controller_that_started_at_the_default_has_nothing_to_revert(monkeypa
     assert announced == []
 
 
-def test_a_switch_outlasting_the_wait_is_announced_once_it_lands(monkeypatch, conversation_loop):
-    """Restarting the voice session can take longer than a poll waits: the switch still lands."""
-    monkeypatch.setattr(rfid_routes, "PERSONALITY_APPLY_WAIT_S", 0.05)
+def test_a_switch_is_announced_before_the_session_restart_ends(monkeypatch, conversation_loop):
+    """Restarting the voice session takes seconds: clients hear of the switch when it is in effect."""
     monkeypatch.setattr(rfid_routes, "list_personalities", lambda: ["default", "pirate"])
     controller, announced = removal_controller(monkeypatch, conversation_loop)
-    handler = _StubHandler(delay=0.3)
+    # Longer than the poll waits: the call returns while the restart still runs.
+    monkeypatch.setattr(rfid_routes, "PERSONALITY_APPLY_WAIT_S", 0.05)
 
-    controller._on_tag_read(handler, to_tag_token("pirate"))
-    assert announced == []
+    controller._on_tag_read(_StubHandler(delay=0.3), to_tag_token("pirate"))
+
+    assert announced == ["pirate"]
     # Taking the accessory off meanwhile still reverts it: the switch was recorded.
     assert controller._current_personality == "pirate"
-
     asyncio.run_coroutine_threadsafe(asyncio.sleep(0.5), conversation_loop).result(timeout=2)
     assert announced == ["pirate"]
 
 
-def test_a_slow_switch_overtaken_by_a_newer_one_is_not_announced(monkeypatch, conversation_loop):
-    """An accessory taken off before its personality landed must not have the last word."""
+def test_an_accessory_taken_off_mid_switch_has_the_last_word(monkeypatch, conversation_loop):
+    """The revert is announced after the switch it interrupted, and nothing comes after it."""
     monkeypatch.setattr(rfid_routes, "PERSONALITY_APPLY_WAIT_S", 0.05)
     monkeypatch.setattr(rfid_routes, "list_personalities", lambda: ["default", "pirate"])
     controller, announced = removal_controller(monkeypatch, conversation_loop)
@@ -289,8 +292,23 @@ def test_a_slow_switch_overtaken_by_a_newer_one_is_not_announced(monkeypatch, co
     controller._on_tag_read(handler, to_tag_token("pirate"))
     controller._on_tag_removed(handler)
 
-    asyncio.run_coroutine_threadsafe(asyncio.sleep(0.5), conversation_loop).result(timeout=2)
-    assert announced == [None]
+    asyncio.run_coroutine_threadsafe(asyncio.sleep(0.8), conversation_loop).result(timeout=2)
+    assert announced == ["pirate", None]
+    assert controller._current_personality is None
+
+
+def test_a_personality_that_cannot_be_loaded_is_not_announced(monkeypatch, conversation_loop):
+    """The handler then keeps the previous one: telling clients otherwise would be a lie."""
+    monkeypatch.setattr(rfid_routes, "list_personalities", lambda: ["default", "pirate"])
+    controller, announced = removal_controller(monkeypatch, conversation_loop)
+
+    class Unloadable(_StubHandler):
+        async def apply_personality(self, profile, on_applied=None):
+            return "Failed to apply personality: unreadable"
+
+    controller._on_tag_read(Unloadable(), to_tag_token("pirate"))
+
+    assert announced == []
     assert controller._current_personality is None
 
 

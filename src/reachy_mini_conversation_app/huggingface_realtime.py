@@ -8,6 +8,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Final, Tuple, Optional
 from collections import deque
+from collections.abc import Callable
 
 import httpx
 import numpy as np
@@ -454,8 +455,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         logger.info("Refreshed session instructions")
         return True
 
-    async def apply_personality(self, profile: str | None) -> str:
-        """Apply a personality to the active or next realtime connection."""
+    async def apply_personality(self, profile: str | None, on_applied: Callable[[], None] | None = None) -> str:
+        """Apply a personality to the active or next realtime connection.
+
+        ``on_applied`` runs once the personality is in effect, before the
+        session restart that follows it, which can take several seconds: a
+        caller showing the personality need not wait for that.
+        """
         previous_profile = config.REACHY_MINI_CUSTOM_PROFILE
         previous_voice_override = self._voice_override
         set_custom_profile(profile)
@@ -472,6 +478,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._voice_override = previous_voice_override
             logger.error("Failed to resolve personality %r: %s", profile, exc)
             return f"Failed to apply personality: {exc}"
+
+        if on_applied is not None:
+            try:
+                on_applied()
+            except Exception as exc:
+                logger.warning("Personality applied callback failed: %s", exc)
 
         # A personality introduces itself when its session opens. Picking one in
         # the panel rebuilds the whole backend, so it gets that for free; a live
