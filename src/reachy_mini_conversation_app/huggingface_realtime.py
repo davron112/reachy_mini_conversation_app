@@ -68,6 +68,8 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
+# A realtime session this old when it drops resets the reconnect budget.
+REALTIME_SESSION_STABLE_S: Final[float] = 30.0
 # Server-measured stage timings the speech-to-speech backend attaches to response.done.
 _TURN_LATENCY_METADATA_KEY: Final[str] = "speech_to_speech.turn_latency"
 
@@ -519,13 +521,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self.client = await self._build_realtime_client()
 
         max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
+        attempt = 0
+        while True:
+            started = time.monotonic()
             try:
                 await self._run_realtime_session()
                 # Normal exit from the session, stop retrying
                 return
             except ConnectionClosedError as e:
-                # Abrupt close (e.g., "no close frame received or sent") → retry
+                # Abrupt close (e.g., "no close frame received or sent") → retry.
+                # A session that connected and lasted starts a fresh budget, so
+                # drops hours apart never exhaust it, while a server dropping
+                # every session at once still makes us give up.
+                lasted = time.monotonic() - started >= REALTIME_SESSION_STABLE_S
+                attempt = 1 if self._connected_event.is_set() and lasted else attempt + 1
                 logger.warning("Realtime websocket closed unexpectedly (attempt %d/%d): %s", attempt, max_attempts, e)
                 if attempt < max_attempts:
                     self.client = await self._build_realtime_client()

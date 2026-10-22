@@ -178,6 +178,48 @@ async def test_server_session_exit_clears_active_listening(monkeypatch: pytest.M
     assert timeout is not None and timeout.cancelled()
 
 
+@pytest.mark.parametrize(
+    ("connects", "lasts_s", "survives"),
+    [
+        (True, 60.0, True),  # drops spread over a long conversation
+        (True, 0.0, False),  # server dropping every session right after connect
+        (False, 60.0, False),  # never connects
+    ],
+)
+@pytest.mark.asyncio
+async def test_realtime_retry_budget_resets_after_a_lasting_session(
+    monkeypatch: pytest.MonkeyPatch, connects: bool, lasts_s: float, survives: bool
+) -> None:
+    """Only sessions that connected and lasted give the retry budget back."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    monkeypatch.setattr(config, "LOCAL_VAD_ENABLED", False)
+    monkeypatch.setattr(handler, "_build_realtime_client", AsyncMock())
+    monkeypatch.setattr(hf_mod.asyncio, "sleep", AsyncMock())
+    clock = [0.0]
+    monkeypatch.setattr(hf_mod.time, "monotonic", lambda: clock[0])
+    drops = 5
+
+    async def session() -> None:
+        nonlocal drops
+        if drops == 0:
+            return
+        drops -= 1
+        if connects:
+            handler._connected_event.set()
+        clock[0] += lasts_s
+        raise hf_mod.ConnectionClosedError(None, None)
+
+    monkeypatch.setattr(handler, "_run_realtime_session", session)
+
+    if survives:
+        await handler.start_up()
+        assert drops == 0
+    else:
+        with pytest.raises(hf_mod.ConnectionClosedError):
+            await handler.start_up()
+        assert drops == 2
+
+
 @pytest.mark.asyncio
 async def test_local_vad_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """Server-only configuration does not load a local model."""
