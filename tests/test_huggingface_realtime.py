@@ -1259,7 +1259,7 @@ async def test_swapping_personality_and_back_restores_the_picked_voice(
     handler = _plain_handler()
 
     await handler.apply_personality("captain_circuit")
-    assert handler.get_current_voice() == "Dylan"
+    assert handler.get_current_voice() == "Aiden"
 
     await handler.apply_personality("hype_bot")
     assert handler.get_current_voice() == "Serena"
