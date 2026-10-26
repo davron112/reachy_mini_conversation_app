@@ -65,7 +65,7 @@ WRITE_MOVE_DATASET = "glannuzel/local-dataset"
 WRITE_MOVE_NAME = "write-tag-6"
 # The sound is started slightly before the movement is queued so the two line up.
 WRITE_SOUND_LEAD_S = 0.15
-ADD_ON_STORE_URL = "https://store.pollen-robotics.com/collections/reachy-mini"
+ADD_ON_STORE_URL = "https://store.pollen-robotics.com/products/reachy-mini-accessory-pack"
 
 HandlerGetter = Callable[[], "HuggingFaceRealtimeHandler"]
 LoopGetter = Callable[[], asyncio.AbstractEventLoop | None]
