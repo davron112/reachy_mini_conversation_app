@@ -198,7 +198,7 @@ button {
   max-width: 320px;
 }
 
-/* Personality badge with its language picker beside it. */
+/* Personality badge. */
 .app-shell__badge-row {
   display: flex;
   align-items: center;
@@ -347,8 +347,11 @@ button {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
+/* Bottom-right corner of the window, out of the personality row's flow. */
 .language-picker {
-  position: relative;
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
 }
 
 .language-picker[hidden],
@@ -405,8 +408,8 @@ button {
 
 .language-picker__menu {
   position: absolute;
-  top: calc(100% + 8px);
-  left: 0;
+  bottom: calc(100% + 8px);
+  right: 0;
   z-index: 1;
   display: grid;
   gap: 12px;
@@ -1535,6 +1538,11 @@ button {
   .app-shell__personality-row {
     right: 20px;
     left: 20px;
+  }
+
+  .language-picker {
+    right: 20px;
+    bottom: 20px;
   }
 
   .app-shell__personality-name {
