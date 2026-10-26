@@ -3,6 +3,7 @@
 export const AVATAR_BY_PROFILE = Object.freeze({
   bored_teenager: "bored-teenager.svg",
   captain_circuit: "captain-circuit.svg",
+  chef_bot_appetit: "chef-bot-appetit.svg",
   chess_coach: "chess-coach.svg",
   cosmic_kitchen: "cosmic-kitchen.svg",
   default: "default.svg",
@@ -11,6 +12,7 @@ export const AVATAR_BY_PROFILE = Object.freeze({
   mars_rover: "mars-rover.svg",
   nature_documentarian: "nature-doc.svg",
   noir_detective: "noir-detective.svg",
+  queen_antennette: "queen-antennette.svg",
   sorry_bro: "sorry-bro.svg",
   time_traveler: "time-traveler.svg",
   victorian_butler: "victorian-butler.svg",

@@ -383,7 +383,9 @@ def _read_in_turn(monkeypatch, controller, readings):
     """Poll the controller once per reading, the daemon answering each in turn."""
     pending = list(readings)
     fake_reader(monkeypatch, connected=True)
-    monkeypatch.setattr(NfcDaemonClient, "get_tag", lambda self: pending.pop(0))
+    # On this controller's client only: a poll thread another test left running
+    # would otherwise eat the readings.
+    monkeypatch.setattr(controller.client, "get_tag", lambda: pending.pop(0))
     return [controller.poll_once()["accessory"]["state"] for _ in readings]
 
 

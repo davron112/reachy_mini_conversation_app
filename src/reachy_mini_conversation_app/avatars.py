@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 AVATAR_BY_PROFILE: dict[str, str] = {
     "bored_teenager": "bored-teenager.svg",
     "captain_circuit": "captain-circuit.svg",
+    "chef_bot_appetit": "chef-bot-appetit.svg",
     "chess_coach": "chess-coach.svg",
     "cosmic_kitchen": "cosmic-kitchen.svg",
     "default": "default.svg",
@@ -28,6 +29,7 @@ AVATAR_BY_PROFILE: dict[str, str] = {
     "mars_rover": "mars-rover.svg",
     "nature_documentarian": "nature-doc.svg",
     "noir_detective": "noir-detective.svg",
+    "queen_antennette": "queen-antennette.svg",
     "sorry_bro": "sorry-bro.svg",
     "time_traveler": "time-traveler.svg",
     "victorian_butler": "victorian-butler.svg",
