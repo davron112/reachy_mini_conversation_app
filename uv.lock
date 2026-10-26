@@ -2544,11 +2544,12 @@ wheels = [
 
 [[package]]
 name = "reachy-mini"
-version = "1.12.0"
+version = "1.13.0rc1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
     { name = "asgiref" },
+    { name = "certifi" },
     { name = "fastapi" },
     { name = "gstreamer-bundle", marker = "sys_platform != 'linux'" },
     { name = "huggingface-hub" },
@@ -2581,9 +2582,9 @@ dependencies = [
     { name = "websockets" },
     { name = "zeroconf" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2a/14/533a24c473de3054f56351fc46decf7e3d82efd4d95e8a0db6e08fcfd4c9/reachy_mini-1.12.0.tar.gz", hash = "sha256:5fc149a8d45034e909629a46d56f473d8ff01503d4ca111b8ad5f7b42285c172", size = 24178044, upload-time = "2026-10-15T13:06:20.465Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0d/2b/e44d092917e71626d9d6ab91b92af6dcb46feb853818e7a48cb04ab65fe1/reachy_mini-1.13.0rc1.tar.gz", hash = "sha256:d5b739a466c25d09e58cf76d5f951b1c237ad24e0615f58c2a9fd35f570c2351", size = 24201809, upload-time = "2026-10-26T10:32:20.29Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/05/90/25732d1239b54f833f0d54a92dfb4443df9746791c6cfb2e0c7e4553f09f/reachy_mini-1.12.0-py3-none-any.whl", hash = "sha256:bcb27d09e1bddc67874bd281d7fa59f08cb4d4b5a3cc5858cd9ffd7de7660b34", size = 24264318, upload-time = "2026-10-15T13:06:16.98Z" },
+    { url = "https://files.pythonhosted.org/packages/ad/48/f57bf090633b60973dd7b409ae56ce8af7c02640df4df8d4de0bbb1d0be0/reachy_mini-1.13.0rc1-py3-none-any.whl", hash = "sha256:28eb64314cc1cf92c3c056b88d68f8f40bd5f15f7ed226607dc7eb3048ee95aa", size = 24287572, upload-time = "2026-10-26T10:32:17.562Z" },
 ]
 
 [[package]]
@@ -2628,7 +2629,7 @@ requires-dist = [
     { name = "pip", specifier = ">=26.2.2" },
     { name = "platformdirs" },
     { name = "python-dotenv" },
-    { name = "reachy-mini", specifier = ">=1.11.0" },
+    { name = "reachy-mini", specifier = "==1.13.0rc1" },
     { name = "reachy-mini-dances-library" },
 ]
 
