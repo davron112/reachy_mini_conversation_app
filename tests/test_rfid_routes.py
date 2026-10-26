@@ -179,7 +179,7 @@ class _StubHandler:
 
 @pytest.fixture
 def conversation_loop():
-    """A running event loop on its own thread, standing in for the conversation loop."""
+    """Run an event loop on its own thread, standing in for the conversation loop."""
     loop = asyncio.new_event_loop()
     thread = threading.Thread(target=loop.run_forever, daemon=True)
     thread.start()
