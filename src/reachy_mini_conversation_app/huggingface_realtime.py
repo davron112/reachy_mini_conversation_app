@@ -950,6 +950,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if event.type == "input_audio_buffer.speech_stopped":
                         self._mark_activity("user_speech_stopped")
                         self._set_listening(server=False)
+                        _schedule_music_duck(self.deps, duck=False)
                         logger.debug("User speech stopped - server will auto-commit with VAD")
 
                     if event.type == "response.output_audio.done":
@@ -970,6 +971,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._playback_interrupted = False
                         self._mark_activity("response_created")
                         self.deps.movement_manager.set_speaking(True)
+                        _schedule_music_duck(self.deps, duck=True)
                         self._response_done_event.clear()
                         self._response_started_or_rejected_event.set()
                         if self._turn_user_done_at is not None and self._turn_response_created_at is None:

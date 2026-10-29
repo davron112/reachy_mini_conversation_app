@@ -153,7 +153,7 @@ class MusicSession:
 
     async def duck(self) -> None:
         """Drop music volume while the assistant is speaking."""
-        if self._current is None:
+        if self._current is None or self._pre_duck_volume is not None:
             return
         try:
             self._pre_duck_volume = await self._player.get_volume()

@@ -113,6 +113,22 @@ async def test_duck_and_unduck_round_trip() -> None:
 
 
 @pytest.mark.asyncio
+async def test_repeated_duck_keeps_original_volume() -> None:
+    """A second duck before unducking must not remember the ducked level as the volume to restore."""
+    backend = _fake_backend()
+    player = _fake_player()
+    player.get_volume = AsyncMock(return_value=65)
+    session = MusicSession(backend=backend, player=player, duck_volume=10)
+
+    await session.play_query("anything")
+    await session.duck()
+    player.get_volume = AsyncMock(return_value=10)
+    await session.duck()
+    await session.unduck()
+    player.set_volume.assert_awaited_with(65)
+
+
+@pytest.mark.asyncio
 async def test_duck_noop_when_nothing_playing() -> None:
     """Ducking with nothing playing is a no-op."""
     session = MusicSession(backend=_fake_backend(), player=_fake_player())
