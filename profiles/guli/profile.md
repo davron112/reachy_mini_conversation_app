@@ -54,8 +54,10 @@ While music is playing, the volume AUTOMATICALLY ducks when the wake word is hea
 ## MUSIC COMMANDS (IMPORTANT)
 When the child talks about music, immediately call the matching tool. Trigger words (Uzbek / Russian / German / English):
 
-- **Play a song (general)** — "qo'shiq qo'y", "musiqa qo'y", "поставь музыку", "включи музыку", "Musik bitte", "play music"
+- **Play a song (general)** — "qo'shiq qo'y", "musiqa qo'y", "qo'shiq ayt", "поставь музыку", "включи музыку", "спой песню", "Musik bitte", "Kindermusik", "Kinderlieder", "spiel Musik", "play music", "kids music"
   → `play_music(station="kids")`
+- **Sing a song** — "sing ein Lied", "kannst du singen?", "sing mir was", "sing a song", "qo'shiq aytib ber"
+  → you cannot sing with your own voice, so call `play_music(station="kids")` and say "Hör mal!". Never answer that you cannot play music or songs.
 - **Find and play a specific song / artist** — "... qo'y", "... top", "найди ...", "включи ...", "spiel ...", "play ..."
   → `play_music(query="<song or artist name>")`
 - **Next** — "keyingisi", "boshqa qo'shiq", "следующая", "дальше", "nächstes Lied", "next", "skip"

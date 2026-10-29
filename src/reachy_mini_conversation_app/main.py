@@ -392,6 +392,8 @@ def run(
         # already in the sleep pose; on a plain stop it stays awake and
         # the daemon returns it to neutral once the process exits.
         movement_manager.stop(reset_to_neutral=False)
+        if music_session is not None:
+            music_session.terminate()
         try:
             robot.disable_wobbling()
         except Exception as e:

@@ -223,6 +223,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._startup_greeting_sent = False
         self._in_flight_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
+        self._tool_followup_requested = False
         self._local_vad: SileroVAD | None = None
         self._local_speech = False
         self._server_speech = False
@@ -878,12 +879,27 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # Parallel tool calls in one turn: respond once every result is in, not per tool.
             if self._tool_batch_needs_response and not self._in_flight_tool_calls:
                 self._tool_batch_needs_response = False
+                self._tool_followup_requested = True
                 await self._safe_response_create()
 
         except ConnectionClosedError:
             logger.warning("Connection closed while sending tool result")
             self.connection = None
             self._response_done_event.set()
+
+    def _is_silent_tool_response(self, response: Any) -> bool:
+        """Return True for a reply that only called tools and never spoke."""
+        if self._tool_followup_requested or response.id == self._audio_response_id:
+            return False
+        return any(getattr(item, "type", None) == "function_call" for item in getattr(response, "output", None) or [])
+
+    async def _request_spoken_followup(self) -> None:
+        """Ask once per user turn for a spoken reply after a tool-only response, once its tools finish."""
+        self._tool_followup_requested = True
+        if self._in_flight_tool_calls:
+            self._tool_batch_needs_response = True
+            return
+        await self._safe_response_create()
 
     async def _run_realtime_session(self) -> None:
         """Establish and manage a single realtime session."""
@@ -944,20 +960,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         if config.REALTIME_INTERRUPT_RESPONSE:
                             await self._interrupt_playback()
                         self._set_listening(server=True)
-                        _schedule_music_duck(self.deps, duck=True)
                         logger.debug("User speech started")
 
                     if event.type == "input_audio_buffer.speech_stopped":
                         self._mark_activity("user_speech_stopped")
                         self._set_listening(server=False)
-                        _schedule_music_duck(self.deps, duck=False)
                         logger.debug("User speech stopped - server will auto-commit with VAD")
 
                     if event.type == "response.output_audio.done":
+                        _schedule_music_duck(self.deps, duck=False)
                         if event.response_id in self._discarded_response_ids:
                             continue
                         self.deps.movement_manager.set_speaking(False)
-                        _schedule_music_duck(self.deps, duck=False)
                         logger.debug("response completed")
 
                     if event.type == "response.output_text.delta":
@@ -971,7 +985,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._playback_interrupted = False
                         self._mark_activity("response_created")
                         self.deps.movement_manager.set_speaking(True)
-                        _schedule_music_duck(self.deps, duck=True)
                         self._response_done_event.clear()
                         self._response_started_or_rejected_event.set()
                         if self._turn_user_done_at is not None and self._turn_response_created_at is None:
@@ -994,6 +1007,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         latency = _parse_turn_latency(event.response.metadata)
                         if latency is not None:
                             self._emit_latency(latency)
+                        if self._is_silent_tool_response(event.response):
+                            await self._request_spoken_followup()
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
                         self._mark_activity("user_transcription_delta")
@@ -1034,6 +1049,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._turn_first_audio_at = None
                         self._in_flight_tool_calls.clear()
                         self._tool_batch_needs_response = False
+                        self._tool_followup_requested = False
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
                         self._emit_transcript("user", transcript, True)
@@ -1053,6 +1069,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if event.type == "response.output_audio.delta":
                         if event.response_id in self._discarded_response_ids:
                             continue
+                        if self._audio_response_id != event.response_id:
+                            _schedule_music_duck(self.deps, duck=True)
                         self._audio_response_id = event.response_id
                         decoded_pcm_bytes = base64.b64decode(event.delta)
                         decoded_pcm = np.frombuffer(decoded_pcm_bytes, dtype=np.int16).reshape(1, -1)

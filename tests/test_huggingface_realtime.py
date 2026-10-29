@@ -1390,12 +1390,16 @@ async def test_speech_started_keeps_playback_when_interrupt_disabled(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_music_ducks_while_user_speaks_and_restores_after_reply(monkeypatch: Any) -> None:
-    """Music volume drops when the user starts talking and comes back once the reply audio is done."""
+async def test_music_ducks_only_while_the_reply_speaks(monkeypatch: Any) -> None:
+    """User speech leaves the music alone; it drops once per reply audio and comes back when that audio is done."""
+    delta = base64.b64encode(np.zeros(160, dtype=np.int16).tobytes()).decode()
     handler = _session_handler(
         monkeypatch,
         (
             _FakeEvent("input_audio_buffer.speech_started"),
+            _FakeEvent("input_audio_buffer.speech_stopped"),
+            _FakeEvent("response.output_audio.delta", delta=delta),
+            _FakeEvent("response.output_audio.delta", delta=delta),
             _FakeEvent("response.output_audio.done"),
         ),
     )
@@ -1447,3 +1451,41 @@ async def test_session_hides_music_tools_without_music_backend(monkeypatch: Any)
     await handler._run_realtime_session()
 
     assert captured["names"] == ["dance"]
+
+
+def _tool_only_response(response_id: str) -> SimpleNamespace:
+    return SimpleNamespace(id=response_id, output=[SimpleNamespace(type="function_call")])
+
+
+@pytest.mark.asyncio
+async def test_tool_only_response_requests_one_spoken_followup() -> None:
+    """A reply that only called tools gets a single spoken follow-up for the turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+
+    assert handler._is_silent_tool_response(_tool_only_response("r1"))
+    await handler._request_spoken_followup()
+
+    assert handler._pending_responses.qsize() == 1
+    assert not handler._is_silent_tool_response(_tool_only_response("r2"))
+
+
+@pytest.mark.asyncio
+async def test_spoken_or_text_responses_need_no_followup() -> None:
+    """Replies that produced audio, or called no tool, are left alone."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._audio_response_id = "r1"
+
+    assert not handler._is_silent_tool_response(_tool_only_response("r1"))
+    assert not handler._is_silent_tool_response(SimpleNamespace(id="r2", output=[SimpleNamespace(type="message")]))
+
+
+@pytest.mark.asyncio
+async def test_spoken_followup_waits_for_running_tools() -> None:
+    """With tools still running, the follow-up is deferred to the tool batch completion."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._in_flight_tool_calls.add("call_1")
+
+    await handler._request_spoken_followup()
+
+    assert handler._pending_responses.qsize() == 0
+    assert handler._tool_batch_needs_response

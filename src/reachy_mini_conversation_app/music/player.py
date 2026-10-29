@@ -5,6 +5,7 @@ import os
 import json
 import uuid
 import shutil
+import signal
 import asyncio
 import logging
 import tempfile
@@ -66,6 +67,10 @@ class AudioPlayer(Protocol):
 
     async def close(self) -> None:
         """Release the player process / resources."""
+        ...
+
+    def terminate(self) -> None:
+        """Release the player synchronously, for shutdown after the event loop is gone."""
         ...
 
 
@@ -203,6 +208,20 @@ class MpvPlayer:
             except (asyncio.TimeoutError, ProcessLookupError):
                 proc.kill()
         self._process = None
+        self._remove_socket()
+
+    def terminate(self) -> None:
+        """Signal the mpv process to exit without needing its event loop."""
+        proc = self._process
+        if proc and proc.returncode is None:
+            try:
+                os.kill(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        self._process = None
+        self._remove_socket()
+
+    def _remove_socket(self) -> None:
         try:
             if self._socket_path.exists():
                 self._socket_path.unlink()
@@ -262,6 +281,10 @@ class VlcPlayer:
 
     async def close(self) -> None:
         """Release the VLC player and instance."""
+        self.terminate()
+
+    def terminate(self) -> None:
+        """Release the VLC player and instance synchronously."""
         try:
             self._player.stop()
             self._player.release()

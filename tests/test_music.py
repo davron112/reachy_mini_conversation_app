@@ -144,3 +144,31 @@ async def test_kids_station_starts_from_top() -> None:
     track = await session.play_kids_station()
     assert track.track_id == "k1"
     assert [t.track_id for t in session.queue] == ["k2"]
+
+
+@pytest.mark.asyncio
+async def test_mpv_terminate_stops_process_and_socket(tmp_path: Any) -> None:
+    """Synchronous terminate ends the player process and removes its IPC socket."""
+    import sys
+    import asyncio
+
+    from reachy_mini_conversation_app.music.player import MpvPlayer
+
+    socket_path = tmp_path / "mpv.sock"
+    socket_path.touch()
+    player = MpvPlayer(socket_path=socket_path)
+    proc = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(30)")
+    player._process = proc
+
+    player.terminate()
+
+    assert await asyncio.wait_for(proc.wait(), timeout=5) != 0
+    assert not socket_path.exists()
+
+
+def test_session_terminate_releases_player() -> None:
+    """Session terminate forwards to the player's synchronous release."""
+    player = _fake_player()
+    player.terminate = MagicMock()
+    MusicSession(backend=_fake_backend(), player=player).terminate()
+    player.terminate.assert_called_once()

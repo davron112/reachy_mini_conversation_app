@@ -176,6 +176,10 @@ class MusicSession:
         """Release the player process."""
         await self._player.close()
 
+    def terminate(self) -> None:
+        """Release the player process synchronously, for app shutdown."""
+        self._player.terminate()
+
     async def _play_track(self, track: TrackInfo) -> None:
         try:
             url = track.stream_url or await self._backend.resolve_stream_url(track)
