@@ -60,3 +60,8 @@ cache/
 
 # User-created personalities (managed by UI)
 src/reachy_mini_conversation_app/profiles/user_personalities/
+models/
+
+# Local tooling and training data
+.grok/
+wakeword_training/

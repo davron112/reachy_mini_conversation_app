@@ -22,9 +22,11 @@ logger = logging.getLogger(__name__)
 class DanceQueueMove(Move):  # type: ignore
     """Wrapper for dance moves to work with the movement queue system."""
 
-    def __init__(self, move_name: str):
-        """Initialize a DanceQueueMove."""
+    def __init__(self, move_name: str, bpm: float | None = None):
+        """Initialize a DanceQueueMove, optionally at a custom tempo."""
         self.dance_move = DanceMove(move_name)
+        if bpm is not None:
+            self.dance_move.default_bpm = bpm
         self.move_name = move_name
 
     @property

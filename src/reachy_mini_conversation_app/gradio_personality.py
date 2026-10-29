@@ -5,6 +5,7 @@ conversation "personalities" (profiles) so that `main.py` stays lean.
 """
 
 from __future__ import annotations
+import os
 from typing import Any
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from reachy_mini_conversation_app.config import (
     get_default_voice_for_backend,
     get_available_voices_for_backend,
 )
+from reachy_mini_conversation_app.audio.mic_input import mic_gain
 
 
 class PersonalityUI:
@@ -42,6 +44,7 @@ class PersonalityUI:
         self.new_personality_btn: gr.Button
         self.available_tools_cg: gr.CheckboxGroup
         self.save_btn: gr.Button
+        self.settings_md: gr.Markdown
 
     # ---------- Filesystem helpers ----------
     def _list_personalities(self) -> list[str]:
@@ -63,7 +66,13 @@ class PersonalityUI:
         return names
 
     def _resolve_profile_dir(self, selection: str) -> Path:
-        return self._profiles_root / selection
+        candidate = (self._profiles_root / selection).resolve()
+        root = self._profiles_root.resolve()
+        if not candidate.is_relative_to(root):
+            raise ValueError(
+                f"Profile selection '{selection}' escapes profiles root."
+            )
+        return candidate
 
     def _read_instructions_for(self, name: str) -> str:
         try:
@@ -101,7 +110,7 @@ class PersonalityUI:
         local: list[str] = []
         try:
             if selected != self.DEFAULT_OPTION:
-                for py in (self._profiles_root / selected).glob("*.py"):
+                for py in self._resolve_profile_dir(selected).glob("*.py"):
                     local.append(py.stem)
         except Exception:
             pass
@@ -125,6 +134,27 @@ class PersonalityUI:
         s = re.sub(r"\s+", "_", s)
         s = re.sub(r"[^a-zA-Z0-9_-]", "", s)
         return s
+
+    # ---------- Settings summary ----------
+    @staticmethod
+    def _build_settings_summary() -> str:
+        def env(key: str, default: str = "—") -> str:
+            val = os.getenv(key)
+            return val if val not in (None, "") else default
+
+        profile = config.REACHY_MINI_CUSTOM_PROFILE or LOCKED_PROFILE or "(default)"
+        wake_on = env("REACHY_WAKE_WORD_ENABLED", "0") in {"1", "true", "True"}
+        rows = [
+            ("Backend", f"{config.BACKEND_PROVIDER} · {env('MODEL_NAME', 'backend default')}"),
+            ("Personality", profile),
+            ("Voice", get_default_voice_for_backend()),
+            ("Speaker output gain", env("REACHY_OUTPUT_GAIN", "1.0")),
+            ("Mic gain", str(mic_gain())),
+            ("Wake word", (f"on · {env('REACHY_WAKE_WORD_PHRASES')}" if wake_on else "off")),
+            ("Music", f"{env('REACHY_MUSIC_BACKEND', 'auto')} · vol {env('REACHY_MUSIC_VOLUME', '—')}"),
+        ]
+        body = "\n".join(f"| {k} | {v} |" for k, v in rows)
+        return "### Current settings\n\n| Setting | Value |\n| --- | --- |\n" + body
 
     # ---------- Public API ----------
     def create_components(self) -> None:
@@ -175,6 +205,7 @@ class PersonalityUI:
             interactive=not is_locked,
         )
         self.save_btn = gr.Button("Save personality (instructions + tools)", interactive=not is_locked)
+        self.settings_md = gr.Markdown(value=self._build_settings_summary())
 
     def additional_inputs_ordered(self) -> list[Any]:
         """Return the additional inputs in the expected order for Stream."""
@@ -190,6 +221,7 @@ class PersonalityUI:
             self.voice_dropdown,
             self.available_tools_cg,
             self.save_btn,
+            self.settings_md,
         ]
 
     # ---------- Event wiring ----------

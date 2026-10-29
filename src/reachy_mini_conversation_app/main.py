@@ -30,6 +30,25 @@ def update_chatbot(chatbot: List[Dict[str, Any]], response: Dict[str, Any]) -> L
     return chatbot
 
 
+def _auto_wake_robot(robot: ReachyMini, logger: Any) -> None:
+    """Enable motors and run the wake-up move so the robot is ready to interact.
+
+    Best-effort: motor enable and wake-up failures are logged but do not block the
+    rest of app startup. Useful when the daemon was launched with --no-wake-up-on-start.
+    """
+    try:
+        robot.enable_motors()
+        logger.info("Auto-wake: motors enabled")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Auto-wake: failed to enable motors: %s", exc)
+        return
+    try:
+        robot.wake_up()
+        logger.info("Auto-wake: wake_up move executed")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Auto-wake: failed to play wake_up: %s", exc)
+
+
 def main() -> None:
     """Entrypoint for the Reachy Mini conversation app."""
     args, _ = parse_args()
@@ -98,7 +117,9 @@ def run(
             config.MODEL_NAME,
         )
 
+    from reachy_mini_conversation_app.music import build_music_session
     from reachy_mini_conversation_app.console import LocalStream
+    from reachy_mini_conversation_app.mcp_bridge import build_mcp_bridge
     from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
     from reachy_mini_conversation_app.audio.head_wobbler import HeadWobbler
 
@@ -107,11 +128,13 @@ def run(
 
     if robot is None:
         try:
-            robot_kwargs = {}
+            robot_kwargs: Dict[str, Any] = {}
             if args.robot_name is not None:
                 robot_kwargs["robot_name"] = args.robot_name
 
-            logger.info("Initializing ReachyMini (SDK will auto-detect appropriate backend)")
+            requested_media_backend = (os.getenv("REACHY_MEDIA_BACKEND") or "local").strip().lower()
+            robot_kwargs["media_backend"] = requested_media_backend
+            logger.info("Initializing ReachyMini with media_backend=%s", requested_media_backend)
             robot = ReachyMini(**robot_kwargs)
 
         except TimeoutError as e:
@@ -157,12 +180,29 @@ def run(
 
     head_wobbler = HeadWobbler(set_speech_offsets=movement_manager.set_speech_offsets)
 
+    music_session = build_music_session()
+
+    from reachy_mini_conversation_app.wake_word import WakeWordCoordinator
+    wake_word_coordinator = WakeWordCoordinator(music_session=music_session)
+
+    mcp_bridge = None
+    if os.getenv("MCP_SERVER_URL", "").strip():
+        loop = asyncio.new_event_loop()
+        try:
+            mcp_bridge = loop.run_until_complete(build_mcp_bridge())
+        except Exception as mcp_exc:  # noqa: BLE001
+            logger.warning("MCP bridge unavailable: %s", mcp_exc)
+        finally:
+            loop.close()
+            asyncio.set_event_loop(asyncio.new_event_loop())
+
     deps = ToolDependencies(
         reachy_mini=robot,
         movement_manager=movement_manager,
         camera_worker=camera_worker,
         vision_processor=vision_processor,
         head_wobbler=head_wobbler,
+        music_session=music_session,
     )
     current_file_path = os.path.dirname(os.path.abspath(__file__))
     logger.debug(f"Current file absolute path: {current_file_path}")
@@ -268,7 +308,10 @@ def run(
             robot,
             settings_app=settings_app,
             instance_path=instance_path,
+            wake_word_coordinator=wake_word_coordinator,
         )
+
+    _auto_wake_robot(robot, logger)
 
     # Each async service → its own thread/loop
     movement_manager.start()
@@ -317,6 +360,7 @@ class ReachyMiniConversationApp(ReachyMiniApp):  # type: ignore[misc]
 
     custom_app_url = "http://0.0.0.0:7860/"
     dont_start_webserver = False
+    request_media_backend = "local"
 
     def run(self, reachy_mini: ReachyMini, stop_event: threading.Event) -> None:
         """Run the Reachy Mini conversation app."""

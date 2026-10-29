@@ -8,6 +8,7 @@ Audio formats (per Gemini Live API spec):
   Output: 16-bit PCM, 24 kHz, mono
 """
 
+import os
 import json
 import uuid
 import base64
@@ -20,10 +21,9 @@ from datetime import datetime
 import numpy as np
 import gradio as gr
 from google import genai
-from fastrtc import AdditionalOutputs, wait_for_item, audio_to_int16
+from fastrtc import AdditionalOutputs, wait_for_item
 from google.genai import types
 from numpy.typing import NDArray
-from scipy.signal import resample
 
 from reachy_mini_conversation_app.config import (
     GEMINI_BACKEND,
@@ -32,6 +32,7 @@ from reachy_mini_conversation_app.config import (
     config,
 )
 from reachy_mini_conversation_app.prompts import get_session_voice, get_session_instructions
+from reachy_mini_conversation_app.audio.mic_input import prepare_mic_frame
 from reachy_mini_conversation_app.tools.core_tools import (
     ToolDependencies,
     get_active_tool_specs,
@@ -224,6 +225,7 @@ class GeminiLiveHandler(ConversationHandler):
             self._clear_queue()
         if self.deps.head_wobbler is not None:
             self.deps.head_wobbler.reset()
+        await self._duck_music(True)
         self._set_listening_state(True)
 
     async def _handle_turn_complete(self) -> None:
@@ -234,6 +236,17 @@ class GeminiLiveHandler(ConversationHandler):
         self._set_listening_state(False)
         if self.deps.head_wobbler is not None:
             self.deps.head_wobbler.request_reset_after_current_audio()
+        await self._duck_music(False)
+
+    async def _duck_music(self, duck: bool) -> None:
+        """Duck/unduck the music session if one is wired up."""
+        session = getattr(self.deps, "music_session", None)
+        if session is None:
+            return
+        try:
+            await (session.duck() if duck else session.unduck())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Music duck=%s ignored: %s", duck, exc)
 
     async def apply_personality(self, profile: str | None) -> str:
         """Apply a new personality (profile) at runtime.
@@ -297,33 +310,40 @@ class GeminiLiveHandler(ConversationHandler):
                 self._provided_api_key = textbox_api_key
             else:
                 gemini_api_key = config.GEMINI_API_KEY
-        else:
-            if not gemini_api_key or not gemini_api_key.strip():
-                logger.warning("GEMINI_API_KEY missing. Proceeding with a placeholder (tests/offline).")
-                gemini_api_key = "DUMMY"
+        if not gemini_api_key or not gemini_api_key.strip():
+            raise ValueError(
+                "GEMINI_API_KEY is missing. Set it in the environment, the .env file, "
+                "or supply it via the Gradio textbox before starting a Gemini session."
+            )
 
         self.client = genai.Client(api_key=gemini_api_key)
 
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
+        # Gemini Live sends GoAway after ~10 min and the session must be reopened.
+        # Reconnect forever with exponential backoff capped at 30 s.
+        consecutive_failures = 0
+        max_backoff = 30.0
+        while True:
             try:
                 await self._run_live_session()
                 return
             except Exception as e:
+                consecutive_failures += 1
                 logger.warning(
-                    "Gemini Live session closed unexpectedly (attempt %d/%d): %s",
-                    attempt,
-                    max_attempts,
+                    "Gemini Live session closed unexpectedly (failure #%d): %s",
+                    consecutive_failures,
                     e,
                 )
-                if attempt < max_attempts:
-                    base_delay = 2 ** (attempt - 1)
-                    jitter = random.uniform(0, 0.5)
-                    delay = base_delay + jitter
-                    logger.info("Retrying in %.1f seconds...", delay)
-                    await asyncio.sleep(delay)
-                    continue
-                raise
+                base_delay = min(2 ** min(consecutive_failures - 1, 6), max_backoff)
+                jitter = random.uniform(0, 0.5)
+                delay = base_delay + jitter
+                logger.info("Reconnecting in %.1f seconds...", delay)
+                self.session = None
+                try:
+                    self._connected_event.clear()
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(delay)
+                continue
             finally:
                 self.session = None
                 try:
@@ -379,6 +399,20 @@ class GeminiLiveHandler(ConversationHandler):
         if function_declarations:
             tools_config.append({"function_declarations": function_declarations})
 
+        # More permissive VAD — Reachy mic + ALSA dsnoop levels are quiet, default thresholds
+        # cut quiet speech and "Hey Qarabay" rarely triggers. HIGH start sensitivity means
+        # the model is MORE likely to start a speech turn (Google's convention), and LOW end
+        # sensitivity means it tolerates longer pauses before ending a turn.
+        realtime_input_config = types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                disabled=False,
+                start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
+                prefix_padding_ms=200,
+                silence_duration_ms=1500,
+            ),
+        )
+
         live_config = types.LiveConnectConfig(
             response_modalities=[types.Modality.AUDIO],
             system_instruction=types.Content(parts=[types.Part(text=instructions)]),
@@ -392,6 +426,7 @@ class GeminiLiveHandler(ConversationHandler):
             tools=tools_config,  # type: ignore[arg-type]
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
+            realtime_input_config=realtime_input_config,
         )
 
         logger.info(
@@ -602,6 +637,15 @@ class GeminiLiveHandler(ConversationHandler):
                                             if len(audio_array) == 0:
                                                 continue
 
+                                            try:
+                                                out_gain = float(os.getenv("REACHY_OUTPUT_GAIN", "1.0"))
+                                            except ValueError:
+                                                out_gain = 1.0
+                                            if out_gain != 1.0:
+                                                audio_array = np.clip(
+                                                    audio_array.astype(np.int32) * out_gain, -32768, 32767
+                                                ).astype(np.int16)
+
                                             if self.gradio_mode and self.deps.head_wobbler is not None:
                                                 self.deps.head_wobbler.feed(
                                                     base64.b64encode(audio_bytes).decode("utf-8")
@@ -656,23 +700,7 @@ class GeminiLiveHandler(ConversationHandler):
             return
 
         input_sample_rate, audio_frame = frame
-
-        # Reshape if needed
-        if audio_frame.ndim == 2:
-            if audio_frame.shape[1] > audio_frame.shape[0]:
-                audio_frame = audio_frame.T
-            if audio_frame.shape[1] > 1:
-                audio_frame = audio_frame[:, 0]
-
-        # Resample to 16kHz if needed
-        if GEMINI_INPUT_SAMPLE_RATE != input_sample_rate:
-            audio_frame = resample(
-                audio_frame,
-                int(len(audio_frame) * GEMINI_INPUT_SAMPLE_RATE / input_sample_rate),
-            )
-
-        # Cast to int16
-        audio_frame = audio_to_int16(audio_frame)
+        audio_frame = prepare_mic_frame(audio_frame, input_sample_rate, GEMINI_INPUT_SAMPLE_RATE)
 
         # Send raw PCM bytes to Gemini
         try:

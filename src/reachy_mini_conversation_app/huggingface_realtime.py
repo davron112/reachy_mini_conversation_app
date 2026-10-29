@@ -32,6 +32,8 @@ from reachy_mini_conversation_app.tools.core_tools import get_active_tool_specs
 
 logger = logging.getLogger(__name__)
 
+HF_TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
+
 
 def _build_openai_compatible_client_from_realtime_url(
     realtime_url: str,
@@ -65,6 +67,7 @@ class HuggingFaceRealtimeHandler(BaseRealtimeHandler):
     BACKEND_PROVIDER = HF_BACKEND
     SAMPLE_RATE = 16000
     REFRESH_CLIENT_ON_RECONNECT = True
+    MAX_RECONNECT_ATTEMPTS = None
     AUDIO_INPUT_COST_PER_1M = 0.0
     AUDIO_OUTPUT_COST_PER_1M = 0.0
     TEXT_INPUT_COST_PER_1M = 0.0
@@ -83,6 +86,17 @@ class HuggingFaceRealtimeHandler(BaseRealtimeHandler):
         """Return active tool specs for the current session dependencies."""
         return get_active_tool_specs(self.deps)
 
+    def _interrupt_response_enabled(self) -> bool:
+        """Follow the configured barge-in setting."""
+        return config.REALTIME_INTERRUPT_RESPONSE
+
+    def _get_transcription_config(self) -> AudioTranscriptionParam:
+        """Return the transcription config, letting the server auto-detect when no language is set."""
+        language = config.REALTIME_TRANSCRIPTION_LANGUAGE
+        if language:
+            return AudioTranscriptionParam(model=HF_TRANSCRIPTION_MODEL, language=language)
+        return AudioTranscriptionParam(model=HF_TRANSCRIPTION_MODEL)
+
     def _get_session_config(self, tool_specs: list[dict[str, Any]]) -> RealtimeSessionCreateRequestParam:
         """Return the Hugging Face OpenAI-compatible session config."""
         return RealtimeSessionCreateRequestParam(
@@ -93,8 +107,8 @@ class HuggingFaceRealtimeHandler(BaseRealtimeHandler):
                     # The OpenAI SDK type only includes 24 kHz PCM, but the HF
                     # compatible server uses rate=None for native 16 kHz mode.
                     format=_native_rate_audio_pcm(),  # type: ignore[typeddict-item]
-                    transcription=AudioTranscriptionParam(model="gpt-4o-transcribe", language="en"),
-                    turn_detection=ServerVad(type="server_vad", interrupt_response=True),
+                    transcription=self._get_transcription_config(),
+                    turn_detection=ServerVad(type="server_vad", interrupt_response=self._interrupt_response_enabled()),
                 ),
                 output=RealtimeAudioConfigOutputParam(
                     format=_native_rate_audio_pcm(),  # type: ignore[typeddict-item]

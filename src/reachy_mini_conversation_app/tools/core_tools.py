@@ -57,6 +57,7 @@ class ToolDependencies:
     camera_worker: Any | None = None  # CameraWorker for frame buffering
     vision_processor: Any | None = None
     head_wobbler: Any | None = None  # HeadWobbler for audio-reactive motion
+    music_session: Any | None = None  # MusicSession for music playback (lazy import)
     motion_duration_s: float = 1.0
 
 
@@ -277,9 +278,46 @@ def _initialize_tools() -> None:
 _initialize_tools()
 
 
+_REQUIRED_TOOL_ATTRS: tuple[str, ...] = ("name", "description", "parameters_schema", "spec")
+
+
+def register_runtime_tools(tools: List["Tool"]) -> list[str]:
+    """Register pre-instantiated tool objects after _initialize_tools() has run.
+
+    Uses duck typing so module-reload scenarios (where two copies of the Tool
+    base class exist) still accept valid adapters. Returns the list of names
+    actually added; duplicates and non-tools are skipped with a warning.
+    """
+    added: list[str] = []
+    for tool in tools:
+        if not all(hasattr(tool, attr) for attr in _REQUIRED_TOOL_ATTRS) or not callable(tool):
+            logger.warning("register_runtime_tools: skipping non-Tool object: %r", tool)
+            continue
+        name = getattr(tool, "name", None)
+        if not isinstance(name, str) or not name:
+            logger.warning("register_runtime_tools: skipping tool with invalid name: %r", tool)
+            continue
+        if name in ALL_TOOLS:
+            logger.warning("register_runtime_tools: tool name conflict, skipping: %s", name)
+            continue
+        ALL_TOOLS[name] = tool
+        ALL_TOOL_SPECS.append(tool.spec())
+        added.append(name)
+        logger.info("runtime tool registered: %s - %s", name, getattr(tool, "description", ""))
+    return added
+
+
 def get_tool_specs(exclusion_list: list[str] = []) -> list[Dict[str, Any]]:
     """Get tool specs, optionally excluding some tools."""
     return [spec for spec in ALL_TOOL_SPECS if spec.get("name") not in exclusion_list]
+
+
+MUSIC_TOOL_NAMES: tuple[str, ...] = (
+    "play_music",
+    "music_control",
+    "music_volume",
+    "music_status",
+)
 
 
 def get_active_tool_specs(deps: ToolDependencies) -> list[Dict[str, Any]]:
@@ -287,6 +325,8 @@ def get_active_tool_specs(deps: ToolDependencies) -> list[Dict[str, Any]]:
     exclusion_list: list[str] = []
     if not (deps.camera_worker and deps.camera_worker.head_tracker):
         exclusion_list.append("head_tracking")
+    if deps.music_session is None:
+        exclusion_list.extend(MUSIC_TOOL_NAMES)
     return get_tool_specs(exclusion_list)
 
 

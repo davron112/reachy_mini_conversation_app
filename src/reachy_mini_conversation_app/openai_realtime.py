@@ -214,8 +214,8 @@ class OpenaiRealtimeHandler(BaseRealtimeHandler):
         self._realtime_connect_query = {}
         resolved_api_key = (self._provided_api_key or config.OPENAI_API_KEY or "").strip()
         if not resolved_api_key:
-            # In headless console mode, LocalStream blocks startup until the key is provided.
-            # Unit tests may invoke this handler directly with a stubbed client.
-            logger.warning("OPENAI_API_KEY missing. Proceeding with a placeholder (tests/offline).")
-            resolved_api_key = "DUMMY"
+            raise ValueError(
+                "OPENAI_API_KEY is missing. Set it in the environment, the .env file, "
+                "or supply it via the Gradio textbox before starting an OpenAI session."
+            )
         return AsyncOpenAI(api_key=resolved_api_key)

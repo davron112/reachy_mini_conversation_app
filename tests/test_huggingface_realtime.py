@@ -3,6 +3,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from websockets.exceptions import InvalidMessage
 
 import reachy_mini_conversation_app.base_realtime as base_rt_mod
 import reachy_mini_conversation_app.huggingface_realtime as hf_mod
@@ -648,3 +649,54 @@ def test_huggingface_response_cost_defaults_to_zero() -> None:
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
 
     assert handler._compute_response_cost(usage) == 0.0
+
+
+def test_session_transcription_omits_language_when_unset(monkeypatch: Any) -> None:
+    """Without a configured language the server auto-detects, which Parakeet requires."""
+    monkeypatch.setattr(config, "REALTIME_TRANSCRIPTION_LANGUAGE", None)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    transcription = handler._get_session_config([])["audio"]["input"]["transcription"]
+    assert "language" not in transcription
+    assert transcription["model"] == hf_mod.HF_TRANSCRIPTION_MODEL
+
+
+def test_session_transcription_uses_configured_language(monkeypatch: Any) -> None:
+    """A configured language is forwarded to the realtime server."""
+    monkeypatch.setattr(config, "REALTIME_TRANSCRIPTION_LANGUAGE", "de")
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    assert handler._get_session_config([])["audio"]["input"]["transcription"]["language"] == "de"
+
+
+@pytest.mark.asyncio
+async def test_hf_start_up_keeps_reconnecting_after_network_failures(monkeypatch: Any) -> None:
+    """A local server that is briefly unreachable must not crash the app."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    monkeypatch.setattr(handler, "_build_realtime_client", AsyncMock(return_value=MagicMock()))
+    session = AsyncMock(side_effect=[TimeoutError("handshake"), OSError("refused"), InvalidMessage("no http"), None])
+    monkeypatch.setattr(handler, "_run_realtime_session", session)
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(base_rt_mod.asyncio, "sleep", fake_sleep)
+    await handler.start_up()
+    assert session.await_count == 4
+    assert len(delays) == 3
+    assert all(delay <= base_rt_mod.RECONNECT_MAX_DELAY_S + 0.5 for delay in delays)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_session_interrupt_response_follows_config(monkeypatch: Any, enabled: bool) -> None:
+    """Barge-in can be disabled for noisy rooms."""
+    monkeypatch.setattr(config, "REALTIME_INTERRUPT_RESPONSE", enabled)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    assert handler._get_session_config([])["audio"]["input"]["turn_detection"]["interrupt_response"] is enabled
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_hf_client_flush_follows_interrupt_setting(monkeypatch: Any, enabled: bool) -> None:
+    """With barge-in disabled the robot must not drop its own queued speech on noise."""
+    monkeypatch.setattr(config, "REALTIME_INTERRUPT_RESPONSE", enabled)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    assert handler._interrupt_response_enabled() is enabled

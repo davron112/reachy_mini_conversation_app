@@ -49,6 +49,18 @@ yolo_vision = [
 mediapipe_vision = [
   "mediapipe==0.10.14",
 ]
+music = [
+  "yandex-music>=2.2.0",
+  "python-vlc>=3.0.20",
+]
+mcp = [
+  "mcp>=1.0",
+]
+wake_word = [
+  "openwakeword>=0.6.0",
+  "vosk>=0.3.45",
+  "sounddevice>=0.4.6",
+]
 all_vision = [
   "accelerate>=1.13.0",
   "torch>=2.1",

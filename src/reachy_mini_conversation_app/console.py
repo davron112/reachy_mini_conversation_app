@@ -15,9 +15,10 @@ import sys
 import time
 import asyncio
 import logging
-from typing import List, Optional
+from typing import Any, List, Optional
 from pathlib import Path
 
+import numpy as np
 from fastrtc import AdditionalOutputs, audio_to_float32
 from scipy.signal import resample
 
@@ -43,6 +44,7 @@ from reachy_mini_conversation_app.config import (
     get_hf_connection_selection,
     refresh_runtime_config_from_env,
 )
+from reachy_mini_conversation_app.audio.echo_gate import build_echo_gate
 from reachy_mini_conversation_app.startup_settings import read_startup_settings, write_startup_settings
 from reachy_mini_conversation_app.audio.startup_config import apply_audio_startup_config
 from reachy_mini_conversation_app.conversation_handler import ConversationHandler
@@ -97,6 +99,15 @@ def _estimate_pending_playback_seconds(robot: ReachyMini) -> float:
     return max(0.0, pending_ns / 1e9)
 
 
+def _get_with_timeout(q, timeout):
+    """Block on a thread-safe queue with a timeout, returning None when empty."""
+    import queue as _stdqueue
+    try:
+        return q.get(timeout=timeout)
+    except _stdqueue.Empty:
+        return None
+
+
 class LocalStream:
     """LocalStream using Reachy Mini's recorder/player."""
 
@@ -107,11 +118,13 @@ class LocalStream:
         *,
         settings_app: Optional[FastAPI] = None,
         instance_path: Optional[str] = None,
+        wake_word_coordinator: Optional[Any] = None,
     ):
         """Initialize the stream with a realtime handler and pipelines.
 
         - ``settings_app``: the Reachy Mini Apps FastAPI to attach settings endpoints.
         - ``instance_path``: directory where per-instance ``.env`` should be stored.
+        - ``wake_word_coordinator``: optional WakeWordCoordinator. When set and a valid wake-word model is configured via env, mic frames are forked into an openWakeWord detector that triggers the coordinator on hits.
         """
         self.handler = handler
         self._robot = robot
@@ -124,6 +137,9 @@ class LocalStream:
         self._settings_initialized = False
         self._asyncio_loop = None
         self._active_backend_name = get_backend_choice()
+        self._wake_word_coordinator = wake_word_coordinator
+        self._wake_word_detector = None
+        self._echo_gate = build_echo_gate()
 
     # ---- Settings UI ----
     def _read_env_lines(self, env_path: Path) -> list[str]:
@@ -629,6 +645,8 @@ class LocalStream:
     def clear_audio_queue(self) -> None:
         """Flush the player's appsrc to drop any queued audio immediately."""
         logger.info("User intervention: flushing player queue")
+        if self._echo_gate is not None:
+            self._echo_gate.reset()
         backend = getattr(self._robot.media, "backend", None)
         audio = getattr(self._robot.media, "audio", None)
         if audio is not None:
@@ -651,16 +669,133 @@ class LocalStream:
                 audio.clear_player()
         self.handler.output_queue = asyncio.Queue()
 
+    def _mic_open(self) -> bool:
+        """Whether mic frames may reach the wake-word detector and the handler."""
+        return self._echo_gate is None or self._echo_gate.is_open
+
     async def record_loop(self) -> None:
-        """Read mic frames from the recorder and forward them to the handler."""
+        """Read mic frames and forward them to the handler.
+
+        On Reachy Mini Wireless the SDK's GStreamer record pipeline sometimes
+        fails to start (state change error). Setting REACHY_DIRECT_ALSA_MIC=1
+        switches to a sounddevice-based capture from the configured ALSA device
+        (default: reachymini_audio_src dsnoop) which is the same source the
+        daemon publishes.
+        """
+        use_direct = (os.getenv("REACHY_DIRECT_ALSA_MIC") or "").strip() in {"1", "true", "yes", "on"}
+        if use_direct:
+            await self._record_loop_direct_alsa()
+            return
+
         input_sample_rate = self._robot.media.get_input_audio_samplerate()
         logger.debug(f"Audio recording started at {input_sample_rate} Hz")
 
         while not self._stop_event.is_set():
             audio_frame = self._robot.media.get_audio_sample()
-            if audio_frame is not None:
+            if audio_frame is not None and self._mic_open():
                 await self.handler.receive((input_sample_rate, audio_frame))
             await asyncio.sleep(0)  # avoid busy loop
+
+    async def _record_loop_direct_alsa(self) -> None:
+        """Capture mic directly from ALSA dsnoop, bypassing the SDK pipeline.
+
+        Two-stage pipeline so the sounddevice audio callback never blocks:
+        - PortAudio callback drops one frame into a bounded asyncio queue.
+        - An async consumer drains the queue and awaits handler.receive().
+        """
+        try:
+            import sounddevice as sd
+        except ImportError:
+            logger.error("REACHY_DIRECT_ALSA_MIC=1 requires sounddevice. Install with: pip install sounddevice")
+            return
+
+        device = (os.getenv("REACHY_ALSA_MIC_DEVICE") or "reachymini_audio_src").strip()
+        rate = int(os.getenv("REACHY_ALSA_MIC_RATE", "16000"))
+        channels = int(os.getenv("REACHY_ALSA_MIC_CHANNELS", "2"))
+        block = int(os.getenv("REACHY_ALSA_MIC_BLOCK", "1024"))
+        queue_size = int(os.getenv("REACHY_ALSA_MIC_QUEUE", "32"))
+
+        logger.info(
+            "Direct ALSA mic capture: device=%s rate=%d channels=%d block=%d queue=%d",
+            device, rate, channels, block, queue_size,
+        )
+
+        import queue as _stdqueue
+
+        loop = asyncio.get_running_loop()
+        frame_queue: "_stdqueue.Queue[Any]" = _stdqueue.Queue(maxsize=queue_size)
+        dropped = {"count": 0}
+
+        if self._wake_word_coordinator is not None and self._wake_word_detector is None:
+            try:
+                from reachy_mini_conversation_app.wake_word.detector import build_wake_word_detector
+                self._wake_word_detector = build_wake_word_detector(
+                    on_wake=self._wake_word_coordinator.on_wake,
+                    loop=loop,
+                )
+                if self._wake_word_detector is not None:
+                    self._wake_word_detector.start()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Wake-word detector init failed: %s", exc)
+                self._wake_word_detector = None
+
+        def callback(indata, frames, time_info, status):  # type: ignore[no-untyped-def]
+            if status:
+                logger.debug("sounddevice status: %s", status)
+            try:
+                frame_queue.put_nowait(indata.copy())
+            except _stdqueue.Full:
+                dropped["count"] += 1
+                if dropped["count"] % 50 == 1:
+                    logger.warning("Direct ALSA: queue full, dropped %d frames so far", dropped["count"])
+
+        forwarded = 0
+        try:
+            with sd.InputStream(
+                device=device,
+                samplerate=rate,
+                channels=channels,
+                dtype="int16",
+                blocksize=block,
+                callback=callback,
+            ):
+                while not self._stop_event.is_set():
+                    sample = await loop.run_in_executor(None, _get_with_timeout, frame_queue, 0.5)
+                    if sample is None or not self._mic_open():
+                        continue
+                    if self._wake_word_detector is not None:
+                        try:
+                            if sample.ndim == 1:
+                                mono = sample
+                            else:
+                                # Match the gating downmix: per-sample louder channel (absmax).
+                                a32 = sample.astype("int32")
+                                if a32.shape[1] > 1:
+                                    abs_idx = np.abs(a32).argmax(axis=1)
+                                    mono = a32[np.arange(a32.shape[0]), abs_idx].astype("int16")
+                                else:
+                                    mono = a32[:, 0].astype("int16")
+                            self._wake_word_detector.feed(mono)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("wake-word feed failed: %s", exc)
+                    # Gate audio to Gemini behind the wake-word coordinator: only forward
+                    # frames during the active listening window (e.g. 12 s after wake fires).
+                    # If no detector is configured, always forward (legacy continuous mode).
+                    if self._wake_word_detector is not None and self._wake_word_coordinator is not None:
+                        forward_to_handler = self._wake_word_coordinator.is_active
+                    else:
+                        forward_to_handler = True
+                    if not forward_to_handler:
+                        continue
+                    try:
+                        await self.handler.receive((rate, sample))
+                        forwarded += 1
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("handler.receive failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Direct ALSA capture failed: %s", exc)
+        finally:
+            logger.info("Direct ALSA mic capture stopped; forwarded=%d dropped=%d", forwarded, dropped["count"])
 
     async def play_loop(self) -> None:
         """Fetch outputs from the handler: log text and play audio frames."""
@@ -713,6 +848,8 @@ class LocalStream:
                     head_wobbler.feed_pcm(audio_data.reshape(1, -1), input_sample_rate, start_delay_s=playback_delay_s)
 
                 self._robot.media.push_audio_sample(audio_frame)
+                if self._echo_gate is not None:
+                    self._echo_gate.note_playback(len(audio_frame) / output_sample_rate)
 
             else:
                 logger.debug("Ignoring output type=%s", type(handler_output).__name__)

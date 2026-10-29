@@ -608,6 +608,7 @@ async def test_start_up_retries_on_abrupt_close(monkeypatch: Any, caplog: Any) -
     # Patch the OpenAI client used by the handler
     monkeypatch.setattr(rt_mod, "AsyncOpenAI", FakeClient)
     monkeypatch.setattr(config, "BACKEND_PROVIDER", "openai")
+    monkeypatch.setattr(config, "OPENAI_API_KEY", "sk-test-retry")
 
     # Build handler with minimal deps
     deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
@@ -1059,6 +1060,7 @@ async def test_response_sender_retries_on_active_response_rejection(monkeypatch:
 
     monkeypatch.setattr(rt_mod, "AsyncOpenAI", FakeClient)
     monkeypatch.setattr(config, "BACKEND_PROVIDER", "openai")
+    monkeypatch.setattr(config, "OPENAI_API_KEY", "sk-test-sender")
 
     # Patch dispatch_tool_call so tools complete with a result.
     async def _fake_dispatch(tool_name: str, args_json: str, deps: Any, **_kw: Any) -> dict[str, Any]:
@@ -1337,3 +1339,17 @@ async def test_openai_excludes_head_tracking_when_no_head_tracker(monkeypatch: A
     tool_names = [t["name"] for t in session_tools]
     assert "head_tracking" not in tool_names, "case 2 failed: camera_worker.head_tracker=None"
     assert "fake_tool" in tool_names, "case 2 failed: a non-head-tracking tool was unexpectedly excluded"
+
+
+@pytest.mark.asyncio
+async def test_openai_start_up_gives_up_after_bounded_network_failures(monkeypatch: Any) -> None:
+    """Hosted backends keep the bounded retry budget so a dead endpoint surfaces quickly."""
+    handler = OpenaiRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    monkeypatch.setattr(handler, "_prepare_startup_credentials", AsyncMock())
+    monkeypatch.setattr(handler, "_build_realtime_client", AsyncMock(return_value=MagicMock()))
+    session = AsyncMock(side_effect=TimeoutError("handshake"))
+    monkeypatch.setattr(handler, "_run_realtime_session", session)
+    monkeypatch.setattr(base_rt_mod.asyncio, "sleep", AsyncMock())
+    with pytest.raises(TimeoutError):
+        await handler.start_up()
+    assert session.await_count == base_rt_mod.DEFAULT_MAX_RECONNECT_ATTEMPTS

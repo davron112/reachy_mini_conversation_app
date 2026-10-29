@@ -12,10 +12,9 @@ from datetime import datetime
 import numpy as np
 import gradio as gr
 from openai import AsyncOpenAI
-from fastrtc import AdditionalOutputs, wait_for_item, audio_to_int16
+from fastrtc import AdditionalOutputs, wait_for_item
 from pydantic import Field, BaseModel
 from numpy.typing import NDArray
-from scipy.signal import resample
 from openai.types.realtime import (
     RealtimeAudioConfigParam,
     RealtimeToolsConfigParam,
@@ -24,7 +23,7 @@ from openai.types.realtime import (
     RealtimeResponseCreateParamsParam,
     RealtimeSessionCreateRequestParam,
 )
-from websockets.exceptions import ConnectionClosedError
+from websockets.exceptions import InvalidHandshake, ConnectionClosedError
 from openai.resources.realtime.realtime import AsyncRealtimeConnection
 
 from reachy_mini_conversation_app.config import (
@@ -32,6 +31,7 @@ from reachy_mini_conversation_app.config import (
     get_default_voice_for_backend,
     get_available_voices_for_backend,
 )
+from reachy_mini_conversation_app.audio.mic_input import prepare_mic_frame
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.conversation_handler import ConversationHandler
 from reachy_mini_conversation_app.tools.background_tool_manager import (
@@ -45,6 +45,21 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
+RECONNECT_MAX_DELAY_S: Final[float] = 30.0
+DEFAULT_MAX_RECONNECT_ATTEMPTS: Final[int] = 3
+
+
+def _schedule_music_duck(deps: ToolDependencies, duck: bool) -> None:
+    """Schedule a duck/unduck on the music session if one is wired up."""
+    session = getattr(deps, "music_session", None)
+    if session is None:
+        return
+    coro = session.duck() if duck else session.unduck()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(coro)
 
 
 class InputTranscriptChunksByItem(BaseModel):
@@ -83,6 +98,7 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
     BACKEND_PROVIDER: ClassVar[str]
     SAMPLE_RATE: ClassVar[int]
     REFRESH_CLIENT_ON_RECONNECT: ClassVar[bool]
+    MAX_RECONNECT_ATTEMPTS: ClassVar[Optional[int]] = DEFAULT_MAX_RECONNECT_ATTEMPTS
     AUDIO_INPUT_COST_PER_1M: ClassVar[float]
     AUDIO_OUTPUT_COST_PER_1M: ClassVar[float]
     TEXT_INPUT_COST_PER_1M: ClassVar[float]
@@ -210,6 +226,10 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
     def _response_done_timeout(self) -> float:
         """Return the response completion timeout."""
         return _RESPONSE_DONE_TIMEOUT
+
+    def _interrupt_response_enabled(self) -> bool:
+        """Whether new user speech may cut off the assistant's queued or playing reply."""
+        return True
 
     def _connection_closed_errors(self) -> tuple[type[BaseException], ...]:
         """Return websocket closure exceptions handled as reconnectable/ignorable."""
@@ -377,32 +397,30 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         """Let providers persist credentials after a successful session update."""
 
     async def start_up(self) -> None:
-        """Start the handler with minimal retries on unexpected websocket closure."""
+        """Start the handler, reconnecting after transient websocket or network failures."""
         await self._prepare_startup_credentials()
         self.client = await self._build_realtime_client()
 
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
+        transient_errors = (*self._connection_closed_errors(), InvalidHandshake, TimeoutError, OSError)
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 await self._run_realtime_session()
-                # Normal exit from the session, stop retrying
                 return
-            except self._connection_closed_errors() as e:
-                # Abrupt close (e.g., "no close frame received or sent") → retry
-                logger.warning("Realtime websocket closed unexpectedly (attempt %d/%d): %s", attempt, max_attempts, e)
-                if attempt < max_attempts:
-                    if self.REFRESH_CLIENT_ON_RECONNECT:
-                        self.client = await self._build_realtime_client()
-                    # exponential backoff with jitter
-                    base_delay = 2 ** (attempt - 1)  # 1s, 2s, 4s, 8s, etc.
-                    jitter = random.uniform(0, 0.5)
-                    delay = base_delay + jitter
-                    logger.info("Retrying in %.1f seconds...", delay)
-                    await asyncio.sleep(delay)
-                    continue
-                raise
+            except transient_errors as e:
+                limit = self.MAX_RECONNECT_ATTEMPTS
+                logger.warning(
+                    "Realtime websocket closed unexpectedly or failed to connect (attempt %d/%s): %s", attempt, limit if limit else "unlimited", e
+                )
+                if limit is not None and attempt >= limit:
+                    raise
+                if self.REFRESH_CLIENT_ON_RECONNECT:
+                    self.client = await self._build_realtime_client()
+                delay = min(2 ** (attempt - 1), RECONNECT_MAX_DELAY_S) + random.uniform(0, 0.5)
+                logger.info("Retrying in %.1f seconds...", delay)
+                await asyncio.sleep(delay)
             finally:
-                # never keep a stale reference
                 self.connection = None
                 try:
                     self._connected_event.clear()
@@ -703,11 +721,16 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                         self._turn_user_done_at = None
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
-                        if hasattr(self, "_clear_queue") and callable(self._clear_queue):
+                        if (
+                            self._interrupt_response_enabled()
+                            and hasattr(self, "_clear_queue")
+                            and callable(self._clear_queue)
+                        ):
                             self._clear_queue()
                         if self.deps.head_wobbler is not None:
                             self.deps.head_wobbler.reset()
                         self.deps.movement_manager.set_listening(True)
+                        _schedule_music_duck(self.deps, duck=True)
                         logger.debug("User speech started")
 
                     if event.type == "input_audio_buffer.speech_stopped":
@@ -718,6 +741,7 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                     if event.type == "response.output_audio.done":
                         if self.deps.head_wobbler is not None:
                             self.deps.head_wobbler.request_reset_after_current_audio()
+                        _schedule_music_duck(self.deps, duck=False)
                         logger.debug("response completed")
 
                     if event.type == "response.created":
@@ -924,22 +948,7 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             return
 
         input_sample_rate, audio_frame = frame
-
-        # Reshape if needed
-        if audio_frame.ndim == 2:
-            # Scipy channels last convention
-            if audio_frame.shape[1] > audio_frame.shape[0]:
-                audio_frame = audio_frame.T
-            # Multiple channels -> Mono channel
-            if audio_frame.shape[1] > 1:
-                audio_frame = audio_frame[:, 0]
-
-        # Resample if needed
-        if self.input_sample_rate != input_sample_rate:
-            audio_frame = resample(audio_frame, int(len(audio_frame) * self.input_sample_rate / input_sample_rate))
-
-        # Cast if needed
-        audio_frame = audio_to_int16(audio_frame)
+        audio_frame = prepare_mic_frame(audio_frame, input_sample_rate, self.input_sample_rate)
 
         # Send to the realtime input buffer (guard against races during reconnect).
         try:
