@@ -38,7 +38,7 @@ def get_available_dances_and_descriptions() -> str:
     if not DANCE_AVAILABLE:
         return "Moves not available."
 
-    if not AVAILABLE_MOVES:  # if AVAILABLE_MOVES is empty
+    if not AVAILABLE_MOVES:
         return "Moves not available."
 
     output = ""
@@ -56,6 +56,7 @@ class Dance(Tool):
         "Dance now: play a named or random dance move (optionally repeated) at a slow, normal or fast speed. "
         "Replaces any dance in progress, so call it again to change the move or speed."
     )
+    needs_response = False
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -93,7 +94,7 @@ class Dance(Tool):
         if not DANCE_AVAILABLE:
             return {"error": "Dance system not available"}
 
-        if not AVAILABLE_MOVES:  # if AVAILABLE_MOVES is empty
+        if not AVAILABLE_MOVES:
             return {"error": "No moves currently available"}
 
         move_name = kwargs.get("move")

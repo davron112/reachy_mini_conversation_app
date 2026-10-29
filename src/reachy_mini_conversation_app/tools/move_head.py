@@ -16,6 +16,7 @@ class MoveHead(Tool):
 
     name = "move_head"
     description = "Move your head in a given direction: left, right, up, down or front."
+    needs_response = False
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -53,7 +54,7 @@ class MoveHead(Tool):
 
             # Get current state for interpolation
             current_head_pose = deps.reachy_mini.get_current_head_pose()
-            _, current_antennas = deps.reachy_mini.get_current_joint_positions()
+            current_head_joints, current_antennas = deps.reachy_mini.get_current_joint_positions()
 
             # Create goto move
             goto_move = GotoQueueMove(
@@ -65,7 +66,7 @@ class MoveHead(Tool):
                     current_antennas[1],
                 ),  # Skip body_yaw
                 target_body_yaw=0,  # Reset body yaw
-                start_body_yaw=current_antennas[0],  # body_yaw is first in joint positions
+                start_body_yaw=current_head_joints[0],  # body_yaw is first in joint positions
                 duration=deps.motion_duration_s,
             )
 

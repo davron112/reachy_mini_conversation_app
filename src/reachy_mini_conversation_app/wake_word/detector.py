@@ -12,7 +12,7 @@ import asyncio
 import logging
 import threading
 from abc import ABC, abstractmethod
-from typing import Callable, Optional, Awaitable
+from typing import Any, Callable, Optional, Coroutine
 from pathlib import Path
 
 import numpy as np
@@ -37,7 +37,7 @@ OPENWAKEWORD_SAMPLE_RATE = 16000
 OPENWAKEWORD_CHUNK_SAMPLES = 1280
 
 
-WakeCallback = Callable[[str, float], Awaitable[None]]
+WakeCallback = Callable[[str, float], Coroutine[Any, Any, None]]
 
 
 def _is_truthy(value: str | None) -> bool:
@@ -114,7 +114,7 @@ class OpenWakeWordBackend(WakeWordBackend):
             wakeword_model_paths=[self._model_path],
             inference_framework=self._framework,
         )
-        logger.info("openWakeWord loaded; classes=%s", list(self._model.models.keys()))  # type: ignore[attr-defined]
+        logger.info("openWakeWord loaded; classes=%s", list(getattr(self._model, "models", {}).keys()))
 
     def process(self, frame_int16: np.ndarray) -> list[tuple[str, float]]:
         """Buffer the frame into 80 ms chunks, score, and return any detections."""
@@ -186,7 +186,8 @@ class WakeWordDetector:
         self._thread.start()
         logger.info(
             "WakeWordDetector started: backend=%s cooldown=%.2fs",
-            type(self._backend).__name__, self._cooldown_s,
+            type(self._backend).__name__,
+            self._cooldown_s,
         )
 
     def stop(self) -> None:
@@ -272,6 +273,7 @@ def build_wake_word_detector(
     backend: Optional[WakeWordBackend]
     if engine == "vosk":
         from reachy_mini_conversation_app.wake_word.vosk_backend import build_vosk_backend
+
         backend = build_vosk_backend()
     elif engine in {"openwakeword", "oww"}:
         backend = _build_openwakeword_backend()

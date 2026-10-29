@@ -76,9 +76,7 @@ class MpvPlayer:
 
     def __init__(self, socket_path: Path | None = None) -> None:
         """Initialise with an explicit IPC socket path or a temp one."""
-        self._socket_path = socket_path or (
-            Path(tempfile.gettempdir()) / f"reachy_mpv_{uuid.uuid4().hex}.sock"
-        )
+        self._socket_path = socket_path or (Path(tempfile.gettempdir()) / f"reachy_mpv_{uuid.uuid4().hex}.sock")
         self._process: asyncio.subprocess.Process | None = None
         self._volume = DEFAULT_VOLUME
         self._command_lock = asyncio.Lock()
@@ -146,9 +144,12 @@ class MpvPlayer:
                 except Exception:  # noqa: BLE001
                     pass
         try:
-            return json.loads(raw.decode().strip() or "{}")
+            reply = json.loads(raw.decode().strip() or "{}")
         except json.JSONDecodeError as exc:
             raise AudioPlayerError(f"mpv replied with invalid JSON: {raw!r}") from exc
+        if not isinstance(reply, dict):
+            raise AudioPlayerError(f"mpv replied with a non-object: {raw!r}")
+        return reply
 
     async def play(self, url: str) -> None:
         """Replace current playback target with `url`."""
@@ -217,11 +218,9 @@ class VlcPlayer:
     def __init__(self) -> None:
         """Lazy-import python-vlc and instantiate the singleton player."""
         try:
-            import vlc  # type: ignore[import-not-found]
+            import vlc
         except ImportError as exc:
-            raise AudioPlayerError(
-                "python-vlc not installed. Install with: pip install python-vlc"
-            ) from exc
+            raise AudioPlayerError("python-vlc not installed. Install with: pip install python-vlc") from exc
         self._vlc = vlc
         self._instance = vlc.Instance("--quiet")
         if self._instance is None:
@@ -273,9 +272,9 @@ class VlcPlayer:
 
 def _vlc_importable() -> bool:
     try:
-        import importlib
+        import importlib.util
 
-        return importlib.util.find_spec(VLC_PROBE_IMPORT) is not None  # type: ignore[union-attr]
+        return importlib.util.find_spec(VLC_PROBE_IMPORT) is not None
     except Exception:  # noqa: BLE001
         return False
 
@@ -299,6 +298,4 @@ def select_audio_player(preference: str | None = None) -> AudioPlayer:
     if _vlc_importable():
         logger.info("Selected audio player: python-vlc")
         return VlcPlayer()
-    raise AudioPlayerError(
-        "No audio player available. Install mpv or `pip install python-vlc`."
-    )
+    raise AudioPlayerError("No audio player available. Install mpv or `pip install python-vlc`.")

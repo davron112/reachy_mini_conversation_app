@@ -29,10 +29,7 @@ _SYSTEM_TOOL_NAMES: set[str] = {t.value for t in SystemTool}
 class ToolProgress(BaseModel):
     """Progress of a background tool."""
 
-    """the progress of the tool"""
     progress: float = Field(..., ge=0.0, le=1.0)
-
-    """the message of the tool"""
     message: Optional[str] = None
 
 
@@ -41,13 +38,8 @@ class ToolCallRoutine(BaseModel):
 
     model_config = {"arbitrary_types_allowed": True}
 
-    """the name of the tool"""
     tool_name: str
-
-    """the JSON arguments for the tool call"""
     args_json_str: str
-
-    """the dependencies for the tool call"""
     deps: "ToolDependencies"
 
     async def __call__(self, tool_manager: BackgroundToolManager) -> Any:
@@ -63,43 +55,25 @@ class ToolCallRoutine(BaseModel):
 class ToolNotification(BaseModel):
     """Notification payload for completed tools."""
 
-    """the ID of the tool"""
     id: str
-
-    """the name of the tool"""
     tool_name: str
-
-    """whether the tool call was triggered by an idle signal"""
     is_idle_tool_call: bool
-
-    """the status of the tool"""
     status: ToolState
-
-    """the result of the tool"""
     result: Optional[Dict[str, Any]] = None
-
-    """the error of the tool"""
     error: Optional[str] = None
 
 
 class BackgroundTool(ToolNotification):
     """Represents a background tool."""
 
-    """the progress of the tool"""
     progress: Optional[ToolProgress] = None
-
-    """the start time of the tool"""
     started_at: float = Field(default_factory=time.monotonic)
-
-    """the completion time of the tool"""
     completed_at: Optional[float] = None
-
-    """the async tool execution task"""
     _task: Optional[asyncio.Task[None]] = PrivateAttr(default=None)
 
     @property
     def tool_id(self) -> str:
-        """Get the name of the tool."""
+        """Return a unique composite identifier for this tool instance."""
         return f"{self.tool_name}-{self.id}-{self.started_at}"
 
     def get_notification(self) -> ToolNotification:
@@ -124,23 +98,12 @@ class BackgroundToolManager(BaseModel):
 
     """
 
-    """the dictionary of tools"""
     _tools: Dict[str, BackgroundTool] = PrivateAttr(default_factory=dict)
-
-    """the async queue for notifications"""
     _notification_queue: asyncio.Queue[ToolNotification] = PrivateAttr(default_factory=asyncio.Queue)
-
-    """the event loop"""
     _loop: Optional[asyncio.AbstractEventLoop] = PrivateAttr(default=None)
-
-    """internal lifecycle tasks (notification listener, periodic cleanup)"""
     _lifecycle_tasks: list[asyncio.Task[None]] = PrivateAttr(default_factory=list)
-
-    """the maximum duration of a tool execution in seconds (default: 1 day)"""
-    _max_tool_duration_seconds: float = PrivateAttr(default=86400)
-
-    """the maximum time to keep a completed/failed/cancelled tool in memory (default: 1 hour)"""
-    _max_tool_memory_seconds: float = PrivateAttr(default=3600)
+    _max_tool_duration_seconds: float = PrivateAttr(default=86400)  # 1 day
+    _max_tool_memory_seconds: float = PrivateAttr(default=3600)  # 1 hour
 
     def set_loop(
         self,
@@ -182,51 +145,53 @@ class BackgroundToolManager(BaseModel):
         """
         tool_name = tool_call_routine.tool_name
         id = call_id
-        bg_tool = BackgroundTool(
+        background_tool = BackgroundTool(
             id=id,
             tool_name=tool_name,
             is_idle_tool_call=is_idle_tool_call,
             progress=ToolProgress(progress=0.0) if with_progress else None,
             status=ToolState.RUNNING,
         )
-        self._tools[bg_tool.tool_id] = bg_tool
+        self._tools[background_tool.tool_id] = background_tool
 
         async_task = asyncio.create_task(
-            self._run_tool(bg_tool, tool_call_routine),
+            self._run_tool(background_tool, tool_call_routine),
             name=f"bg-{tool_name}-{id}",
         )
-        bg_tool._task = async_task
+        background_tool._task = async_task
 
-        logger.info(f"Started background tool: {bg_tool.tool_name} (id={id})")
+        logger.info(f"Started background tool: {background_tool.tool_name} (id={id})")
 
-        return bg_tool
+        return background_tool
 
     async def _run_tool(
         self,
-        bg_tool: BackgroundTool,
+        background_tool: BackgroundTool,
         tool_call_routine: ToolCallRoutine,
     ) -> None:
         """Execute the tool and handle completion."""
         result: dict[str, Any] = await tool_call_routine(self)
-        bg_tool.completed_at = time.monotonic()
+        background_tool.completed_at = time.monotonic()
         error = result.get("error")
 
         if error is not None:
             if error == "Tool cancelled":
-                bg_tool.status = ToolState.CANCELLED
-                logger.debug(f"Background tool cancelled: {bg_tool.tool_name} (id={bg_tool.id})")
+                background_tool.status = ToolState.CANCELLED
+                logger.debug(f"Background tool cancelled: {background_tool.tool_name} (id={background_tool.id})")
             else:
-                bg_tool.status = ToolState.FAILED
-                logger.debug(f"Background tool failed: {bg_tool.tool_name} (id={bg_tool.id}): {bg_tool.error}")
-            bg_tool.error = result["error"]
+                background_tool.status = ToolState.FAILED
+                logger.debug(
+                    f"Background tool failed: {background_tool.tool_name} (id={background_tool.id}): {background_tool.error}"
+                )
+            background_tool.error = result["error"]
 
         else:
-            bg_tool.result = result
-            bg_tool.status = ToolState.COMPLETED
-            logger.debug(f"Background tool completed: {bg_tool.tool_name} (id={bg_tool.id})")
+            background_tool.result = result
+            background_tool.status = ToolState.COMPLETED
+            logger.debug(f"Background tool completed: {background_tool.tool_name} (id={background_tool.id})")
 
-        await self._notification_queue.put(bg_tool.get_notification())
-        logger.debug(f"Queued notification for tool: {bg_tool.tool_name} (id={bg_tool.id})")
+        await self._notification_queue.put(background_tool.get_notification())
+        logger.debug(f"Queued notification for tool: {background_tool.tool_name} (id={background_tool.id})")
 
     async def update_progress(
         self,
@@ -302,9 +267,9 @@ class BackgroundToolManager(BaseModel):
 
         async def _listener() -> None:
             while True:
-                bg_tool = await self._notification_queue.get()
+                background_tool = await self._notification_queue.get()
                 for callback in tool_callbacks:
-                    await callback(bg_tool)
+                    await callback(background_tool)
 
         async def _cleanup(interval_seconds: float = 5 * 60) -> None:
             while True:

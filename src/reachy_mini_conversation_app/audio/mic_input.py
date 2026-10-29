@@ -5,7 +5,6 @@ import logging
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.signal import resample
 
 
 logger = logging.getLogger(__name__)
@@ -67,20 +66,30 @@ def downmix(audio: NDArray[np.float64], mix: str) -> NDArray[np.float64]:
     if audio.shape[1] == 1:
         return audio[:, 0]
     if mix == CHANNEL_MIX_MEAN:
-        return audio.mean(axis=1)
+        return np.asarray(audio.mean(axis=1), dtype=np.float64)
     if mix == CHANNEL_MIX_FIRST:
         return audio[:, 0]
     if mix == CHANNEL_MIX_SECOND:
         return audio[:, 1]
     loudest = np.abs(audio).argmax(axis=1)
-    return audio[np.arange(audio.shape[0]), loudest]
+    return np.asarray(audio[np.arange(audio.shape[0]), loudest], dtype=np.float64)
+
+
+def resample_linear(audio: NDArray[np.float64], input_rate: int, target_rate: int) -> NDArray[np.float64]:
+    """Resample a mono frame by linear interpolation."""
+    target_len = int(len(audio) * target_rate / input_rate)
+    if target_len <= 0:
+        return audio[:0]
+    source_positions = np.arange(len(audio), dtype=np.float64)
+    target_positions = np.linspace(0.0, len(audio) - 1, target_len)
+    return np.interp(target_positions, source_positions, audio)
 
 
 def prepare_mic_frame(audio: NDArray[np.generic], input_rate: int, target_rate: int) -> NDArray[np.int16]:
     """Downmix, resample, apply gain and convert a mic frame to int16 mono PCM."""
     mono = downmix(_to_int16_scale(audio), channel_mix())
     if input_rate != target_rate and len(mono):
-        mono = resample(mono, int(len(mono) * target_rate / input_rate))
+        mono = resample_linear(mono, input_rate, target_rate)
     gain = mic_gain()
     if gain != DEFAULT_MIC_GAIN:
         mono = mono * gain

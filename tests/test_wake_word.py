@@ -117,8 +117,9 @@ def test_vosk_backend_match_returns_full_score_for_finalized() -> None:
 def test_vosk_backend_match_returns_partial_score_for_partial() -> None:
     """Partial transcripts produce the partial score (a phrase still matches)."""
     backend = VoskBackend(model_path="/tmp/whatever", phrases=["hey guli", "guli"])
-    assert backend._match("guli", score=PARTIAL_SCORE) == ("hey guli", PARTIAL_SCORE) or \
-        backend._match("guli", score=PARTIAL_SCORE) == ("guli", PARTIAL_SCORE)
+    assert backend._match("guli", score=PARTIAL_SCORE) == ("hey guli", PARTIAL_SCORE) or backend._match(
+        "guli", score=PARTIAL_SCORE
+    ) == ("guli", PARTIAL_SCORE)
 
 
 def test_vosk_backend_match_returns_none_for_unrelated_text() -> None:

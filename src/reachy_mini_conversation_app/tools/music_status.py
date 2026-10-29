@@ -14,10 +14,7 @@ class MusicStatus(Tool):
     """Return the current playback state so the assistant can describe it."""
 
     name = "music_status"
-    description = (
-        "Report current music playback: track title, source, queue length, "
-        "and whether playback is active."
-    )
+    description = "Report current music playback: track title, source, queue length, and whether playback is active."
     parameters_schema = {"type": "object", "properties": {}, "required": []}
 
     async def __call__(self, deps: ToolDependencies, **_: Any) -> Dict[str, Any]:

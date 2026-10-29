@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 import logging
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 from pathlib import Path
 
 from reachy_mini_conversation_app.music.types import TrackInfo
@@ -116,16 +116,16 @@ class YandexBackend:
         self._client_cls = ClientAsync
         self._token = token
         self._kids_station_id = kids_station_id
-        self._client = None  # type: ignore[var-annotated]
+        self._client: Any | None = None
 
-    async def _get_client(self):  # type: ignore[no-untyped-def]
+    async def _get_client(self) -> Any:
         if self._client is None:
             client = self._client_cls(self._token)
             await client.init()
             self._client = client
         return self._client
 
-    def _track_to_info(self, track) -> TrackInfo:  # type: ignore[no-untyped-def]
+    def _track_to_info(self, track: Any) -> TrackInfo:
         artists = ", ".join(a.name for a in getattr(track, "artists", []) if getattr(a, "name", None))
         duration_ms = getattr(track, "duration_ms", None)
         return TrackInfo(
@@ -152,7 +152,7 @@ class YandexBackend:
             raise MusicBackendError(f"No download info for track {track.track_id}")
         best = max(download_infos, key=lambda d: getattr(d, "bitrate_in_kbps", 0))
         url = getattr(best, "direct_link", None)
-        if not url:
+        if not isinstance(url, str) or not url:
             raise MusicBackendError(f"Direct link missing for track {track.track_id}")
         return url
 

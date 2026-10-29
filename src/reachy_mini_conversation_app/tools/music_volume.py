@@ -55,7 +55,7 @@ class MusicVolume(Tool):
         try:
             if raw_level is not None:
                 target = int(raw_level)
-            else:
+            elif raw_delta is not None:
                 current = await session.get_volume()
                 target = current + int(raw_delta)
         except (TypeError, ValueError):

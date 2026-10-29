@@ -1,71 +1,102 @@
-"""Bidirectional local audio stream with optional settings UI.
+"""Bidirectional local audio stream with optional web settings UI.
 
-In headless mode, there is no Gradio UI. If the selected backend is missing
-its required API key, we expose a minimal settings page via the Reachy Mini
-Apps settings server so users can pick a backend and provide any missing
-credentials.
-
-The settings UI is served from this package's ``static/`` folder. It persists
-the selected backend and any provided API keys into the app instance's ``.env``
-file when available.
+If the selected backend is missing its required API key, a settings page is
+served via the Reachy Mini Apps settings server so users can configure it.
 """
 
 import os
-import sys
 import time
+import queue
 import asyncio
 import logging
+import itertools
+import threading
 from typing import Any, List, Optional
 from pathlib import Path
+from collections import deque
+from collections.abc import Mapping, Callable
 
 import numpy as np
-from fastrtc import AdditionalOutputs, audio_to_float32
-from scipy.signal import resample
 
 from reachy_mini import ReachyMini
+from reachy_mini.io.jsonrpc import JsonRpcError
+from reachy_mini.apps.jsonrpc_server import JsonRpcServer
 from reachy_mini.media.media_manager import MediaBackend
 from reachy_mini_conversation_app.config import (
     HF_BACKEND,
-    GEMINI_BACKEND,
     LOCKED_PROFILE,
-    OPENAI_BACKEND,
     HF_REALTIME_WS_URL_ENV,
     HF_LOCAL_CONNECTION_MODE,
     HF_DEPLOYED_CONNECTION_MODE,
-    HF_REALTIME_CONNECTION_MODE_ENV,
     config,
-    get_backend_choice,
+    get_default_voice,
     get_hf_session_url,
+    set_custom_profile,
+    get_available_voices,
     get_hf_direct_ws_url,
     build_hf_direct_ws_url,
     has_hf_realtime_target,
     parse_hf_direct_target,
-    get_model_name_for_backend,
     get_hf_connection_selection,
     refresh_runtime_config_from_env,
 )
+from reachy_mini_conversation_app.prompts import get_session_voice, get_session_language, get_session_instructions
+from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_float32
+from reachy_mini_conversation_app.memory_routes import register_memory_methods
+from reachy_mini_conversation_app.profile_store import canonical_profile_name
+from reachy_mini_conversation_app.vision_routes import register_vision_methods
+from reachy_mini_conversation_app.settings_store import (
+    AppSettings,
+    update_settings,
+    apply_settings_to_runtime,
+    load_settings_into_runtime,
+)
 from reachy_mini_conversation_app.audio.echo_gate import build_echo_gate
+from reachy_mini_conversation_app.audio.mic_input import downmix, channel_mix
+from reachy_mini_conversation_app.language_routes import LanguageScope, register_language_methods
 from reachy_mini_conversation_app.startup_settings import read_startup_settings, write_startup_settings
+from reachy_mini_conversation_app.tools.core_tools import ToolDependencies, initialize_tools
+from reachy_mini_conversation_app.tool_space_routes import register_tool_space_methods
+from reachy_mini_conversation_app.personality_routes import (
+    build_personality_ops,
+    register_personality_methods,
+)
+from reachy_mini_conversation_app.profile_tool_routes import register_profile_tool_methods
 from reachy_mini_conversation_app.audio.startup_config import apply_audio_startup_config
-from reachy_mini_conversation_app.conversation_handler import ConversationHandler
-from reachy_mini_conversation_app.headless_personality_ui import mount_personality_routes
+from reachy_mini_conversation_app.conversation_handler import VADStatus, AudioFrame, ConversationHandler
 
 
 try:
     # FastAPI is provided by the Reachy Mini Apps runtime
     from fastapi import FastAPI, Response
     from pydantic import BaseModel
-    from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.responses import FileResponse
     from starlette.staticfiles import StaticFiles
 except Exception:  # pragma: no cover - only loaded when settings_app is used
     FastAPI = object  # type: ignore
     FileResponse = object  # type: ignore
-    JSONResponse = object  # type: ignore
     StaticFiles = object  # type: ignore
     BaseModel = object  # type: ignore
 
-
 logger = logging.getLogger(__name__)
+
+
+def _detach_framework_root_routes(app: "FastAPI") -> None:
+    """Strip framework routes that would shadow the settings UI."""
+    routes = getattr(app, "router", None)
+    routes = getattr(routes, "routes", None) if routes else getattr(app, "routes", None)
+    if routes is None:
+        return
+    survivors = []
+    for route in routes:
+        path = getattr(route, "path", None)
+        is_catch_all = isinstance(path, str) and path.startswith("/{") and path.endswith(":path}")
+        if path in ("/", "/static") or is_catch_all:
+            logger.debug("detaching framework-provided route %r (%s)", path, type(route).__name__)
+            continue
+        survivors.append(route)
+    routes[:] = survivors
+
 
 LOCAL_PLAYER_BACKEND = (
     getattr(MediaBackend, "LOCAL", None)
@@ -73,38 +104,45 @@ LOCAL_PLAYER_BACKEND = (
     or getattr(MediaBackend, "DEFAULT", None)
 )
 
+HandlerFactory = Callable[[Optional[str]], ConversationHandler]
+
 LEGACY_STARTUP_ENV_NAMES = (
     "REACHY_MINI_CUSTOM_PROFILE",
     "REACHY_MINI_VOICE_OVERRIDE",
 )
+BACKEND_RETRY_DELAY_SECONDS = 5.0
+CONVERSATION_HISTORY_LIMIT = 200  # events, about 100 exchanges
+PLAYBACK_LEAD_SECONDS = 0.1  # paced chunks reach the SDK this far ahead of their slot
+DIRECT_ALSA_MIC_ENV = "REACHY_DIRECT_ALSA_MIC"
+ALSA_MIC_DEVICE_ENV = "REACHY_ALSA_MIC_DEVICE"
+ALSA_MIC_RATE_ENV = "REACHY_ALSA_MIC_RATE"
+ALSA_MIC_CHANNELS_ENV = "REACHY_ALSA_MIC_CHANNELS"
+ALSA_MIC_BLOCK_ENV = "REACHY_ALSA_MIC_BLOCK"
+ALSA_MIC_QUEUE_ENV = "REACHY_ALSA_MIC_QUEUE"
+DEFAULT_ALSA_MIC_DEVICE = "reachymini_audio_src"
+DEFAULT_ALSA_MIC_RATE = 16000
+DEFAULT_ALSA_MIC_CHANNELS = 2
+DEFAULT_ALSA_MIC_BLOCK = 1024
+DEFAULT_ALSA_MIC_QUEUE = 32
+ALSA_MIC_POLL_SECONDS = 0.5
+ALSA_DROP_LOG_EVERY = 50
+TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
-def _estimate_pending_playback_seconds(robot: ReachyMini) -> float:
-    """Best-effort estimate of audio still queued in the local player."""
-    media = getattr(robot, "media", None)
-    audio = getattr(media, "audio", None)
-    if audio is None:
-        return 0.0
-
-    next_pts_ns = getattr(audio, "_playback_next_pts_ns", None)
-    get_running_time_ns = getattr(audio, "_get_playback_running_time_ns", None)
-    if next_pts_ns is None or not callable(get_running_time_ns):
-        return 0.0
-
+def _int_env(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
     try:
-        pending_ns = int(next_pts_ns) - int(get_running_time_ns())
-    except Exception:
-        return 0.0
+        return int(raw) if raw else default
+    except ValueError:
+        logger.warning("Invalid %s=%r, using %d", name, raw, default)
+        return default
 
-    return max(0.0, pending_ns / 1e9)
 
-
-def _get_with_timeout(q, timeout):
+def _get_with_timeout(frames: "queue.Queue[Any]", timeout: float) -> Any:
     """Block on a thread-safe queue with a timeout, returning None when empty."""
-    import queue as _stdqueue
     try:
-        return q.get(timeout=timeout)
-    except _stdqueue.Empty:
+        return frames.get(timeout=timeout)
+    except queue.Empty:
         return None
 
 
@@ -118,136 +156,238 @@ class LocalStream:
         *,
         settings_app: Optional[FastAPI] = None,
         instance_path: Optional[str] = None,
+        handler_factory: HandlerFactory | None = None,
+        startup_voice: Optional[str] = None,
+        tool_deps: ToolDependencies | None = None,
+        camera_forced_off: bool = False,
         wake_word_coordinator: Optional[Any] = None,
     ):
         """Initialize the stream with a realtime handler and pipelines.
 
         - ``settings_app``: the Reachy Mini Apps FastAPI to attach settings endpoints.
         - ``instance_path``: directory where per-instance ``.env`` should be stored.
-        - ``wake_word_coordinator``: optional WakeWordCoordinator. When set and a valid wake-word model is configured via env, mic frames are forked into an openWakeWord detector that triggers the coordinator on hits.
+        - ``handler_factory``: builds a fresh handler for the currently selected backend.
+        - ``tool_deps``: live tool dependencies, so vision.* can toggle the camera.
+        - ``wake_word_coordinator``: gates mic audio behind a wake word on the direct ALSA capture path.
         """
-        self.handler = handler
         self._robot = robot
         self._stop_event = asyncio.Event()
+        self._playback_flush_lock = asyncio.Lock()
+        self._playback_clock = 0.0  # monotonic end of audio pushed to the SDK
+        self._restart_requested = asyncio.Event()
         self._tasks: List[asyncio.Task[None]] = []
-        # Allow the handler to flush the player queue when appropriate.
-        self.handler._clear_queue = self.clear_audio_queue
+        self._handler_factory = handler_factory
+        self._voice_override = startup_voice
         self._settings_app: Optional[FastAPI] = settings_app
         self._instance_path: Optional[str] = instance_path
+        self._tool_deps = tool_deps
+        self._camera_forced_off = camera_forced_off
         self._settings_initialized = False
         self._asyncio_loop = None
-        self._active_backend_name = get_backend_choice()
+        self._mic_muted = False  # mic starts live; the UI toggles it via the settings API
+        self._audio_warming_up = False
+        self._backend_connection_state = "not_started"
+        self._backend_error: str | None = None
+        self._backend_retry_delay = BACKEND_RETRY_DELAY_SECONDS
+        # JSON-RPC control surface (mounted at /rpc in _init_settings_ui_if_needed).
+        # Notifications (conversation.turn/phase/transcript/latency/activity) are pushed
+        # here from activity, transcripts and latencies. Survives handler rebuilds (mounted once).
+        self._rpc: Optional[JsonRpcServer] = None
+        self._last_turn_state: Optional[str] = None
+        # This run's final transcripts and latencies, replayed by conversation.history so a page
+        # opened mid-conversation shows earlier turns. In memory only: gone when the app stops.
+        self._conversation_history: deque[dict[str, object]] = deque(maxlen=CONVERSATION_HISTORY_LIMIT)
+        # Seeded from the wall clock so a restarted app's events sort after those an open page has seen.
+        self._conversation_seq = itertools.count(int(time.time() * 1000))
+        # Per-role throttle timestamps for conversation.level (orb audio meter).
+        self._last_level_emit: dict[str, float] = {}
         self._wake_word_coordinator = wake_word_coordinator
-        self._wake_word_detector = None
+        self._wake_word_detector: Optional[Any] = None
+        # Half-duplex: no AEC on the direct ALSA path, so the mic closes while the robot speaks.
         self._echo_gate = build_echo_gate()
+        self._install_handler(handler)
 
-    # ---- Settings UI ----
-    def _read_env_lines(self, env_path: Path) -> list[str]:
-        """Load env file contents or a template as a list of lines."""
-        inst = env_path.parent
+    def _install_handler(self, handler: ConversationHandler) -> None:
+        """Set the active handler and wire LocalStream-owned helpers into it."""
+        self.handler = handler
+        self.handler._clear_queue = self.clear_audio_queue
+        self._attach_observers_to_handler()
+
+    def _attach_observers_to_handler(self) -> None:
+        """Wire the handler's activity, transcript and latency observers to JSON-RPC pushes."""
+        setter = getattr(self.handler, "set_activity_observer", None)
+        if callable(setter):
+            setter(self._dispatch_activity)
+        transcript_setter = getattr(self.handler, "set_transcript_observer", None)
+        if callable(transcript_setter):
+            transcript_setter(self._dispatch_transcript)
+        latency_setter = getattr(self.handler, "set_latency_observer", None)
+        if callable(latency_setter):
+            latency_setter(self._dispatch_latency)
+
+        self.handler.set_vad_observer(self._dispatch_vad)
+
+    def _dispatch_vad(self, status: VADStatus) -> None:
+        if self._rpc is not None:
+            self._rpc.broadcast_threadsafe("conversation.vad", dict(status))
+
+    def _dispatch_transcript(self, role: str, text: str, final: bool) -> None:
+        """Push a conversation.transcript notification, recording final ones in the history."""
+        params: dict[str, object] = {"role": role, "text": text, "final": final}
+        if final:
+            self._publish_conversation_event("conversation.transcript", params)
+        elif self._rpc is not None:
+            self._rpc.broadcast_threadsafe("conversation.transcript", params)
+
+    def _dispatch_latency(self, latency: dict[str, int | str | None]) -> None:
+        """Push a conversation.latency notification and record it in the history."""
+        self._publish_conversation_event("conversation.latency", latency)
+
+    def _publish_conversation_event(self, method: str, params: Mapping[str, object]) -> None:
+        """Record one event in this run's history, then push it with its sequence number."""
+        event_params = {**params, "seq": next(self._conversation_seq)}
+        self._conversation_history.append({"method": method, "params": event_params})
+        if self._rpc is not None:
+            self._rpc.broadcast_threadsafe(method, event_params)
+
+    # Audio level meter for the client orb. RMS is scaled into a visible 0..1
+    # range and capped to ~15 Hz so it stays light on the DataChannel.
+    _LEVEL_INTERVAL_S = 1.0 / 15.0
+    _LEVEL_GAIN = 6.0
+
+    def _emit_level(self, role: str, frame: Any) -> None:
+        """Emit a throttled conversation.level (RMS) for ``role`` (user/assistant)."""
+        if self._rpc is None:
+            return
+        now = time.monotonic()
+        if now - self._last_level_emit.get(role, 0.0) < self._LEVEL_INTERVAL_S:
+            return
+        self._last_level_emit[role] = now
         try:
-            if env_path.exists():
-                try:
-                    return env_path.read_text(encoding="utf-8").splitlines()
-                except Exception:
-                    return []
-            template_text = None
-            ex = inst / ".env.example"
-            if ex.exists():
-                try:
-                    template_text = ex.read_text(encoding="utf-8")
-                except Exception:
-                    template_text = None
-            if template_text is None:
-                try:
-                    cwd_example = Path.cwd() / ".env.example"
-                    if cwd_example.exists():
-                        template_text = cwd_example.read_text(encoding="utf-8")
-                except Exception:
-                    template_text = None
-            if template_text is None:
-                packaged = Path(__file__).parent / ".env.example"
-                if packaged.exists():
-                    try:
-                        template_text = packaged.read_text(encoding="utf-8")
-                    except Exception:
-                        template_text = None
-            return template_text.splitlines() if template_text else []
+            samples = audio_to_float32(frame)
+            rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
         except Exception:
-            return []
-
-    def _active_backend(self) -> str:
-        """Return the backend family of the currently running handler."""
-        return self._active_backend_name
-
-    @staticmethod
-    def _has_key(value: Optional[str]) -> bool:
-        """Return whether a runtime credential value is present."""
-        return bool(value and str(value).strip())
-
-    def _has_required_key(self, backend: str) -> bool:
-        """Return whether the requested backend has its required credential."""
-        if backend == GEMINI_BACKEND:
-            return self._has_key(config.GEMINI_API_KEY)
-        if backend == HF_BACKEND:
-            return has_hf_realtime_target()
-        return self._has_key(config.OPENAI_API_KEY)
-
-    @staticmethod
-    def _requirement_name(backend: str) -> str:
-        """Return the env var users need for a backend, if any."""
-        if backend == GEMINI_BACKEND:
-            return "GEMINI_API_KEY"
-        if backend == HF_BACKEND:
-            return HF_REALTIME_WS_URL_ENV
-        return "OPENAI_API_KEY"
-
-    def _persist_env_value(self, env_name: str, value: str) -> None:
-        """Persist a non-empty environment value in memory and in the instance `.env`."""
-        self._persist_env_values({env_name: value})
-
-    def _persist_env_values(self, updates: dict[str, str]) -> None:
-        """Persist non-empty environment values in memory and in the instance `.env`."""
-        normalized_updates = {name: (value or "").strip() for name, value in updates.items()}
-        normalized_updates = {name: value for name, value in normalized_updates.items() if value}
-        if not normalized_updates:
             return
+        level = max(0.0, min(1.0, rms * self._LEVEL_GAIN))
+        self._rpc.broadcast_threadsafe("conversation.level", {"role": role, "rms": round(level, 3)})
 
-        for env_name, value in normalized_updates.items():
-            try:
-                os.environ[env_name] = value
-            except Exception:
-                pass
-        refresh_runtime_config_from_env()
+    # Map backend activity reasons to the orb's turn states (mirrors the old
+    # browser orb's mapActivityToState so the orb reliably reaches listening/
+    # thinking/speaking across the reasons the HF handler actually emits).
+    # Transcript text is delivered separately via the transcript observer.
+    _REASON_TO_TURN = {
+        "user_speech_started": "listening",
+        "user_transcription_delta": "listening",
+        "user_speech_stopped": "thinking",
+        "user_transcription_completed": "thinking",
+        "response_created": "thinking",
+        "tool_call_received": "thinking",
+        "tool_result_ready": "thinking",
+        "assistant_audio_delta": "speaking",
+        "assistant_transcript_done": "ready",
+    }
 
-        if not self._instance_path:
+    def _dispatch_activity(self, reason: str) -> None:
+        """Fan one activity reason out to JSON-RPC clients."""
+        if self._rpc is not None:
+            # Raw reason (the browser orb maps it exactly like the old SSE feed)...
+            self._rpc.broadcast_threadsafe("conversation.activity", {"reason": reason})
+            # ...plus a semantic turn state for clients without that mapping (mobile).
+            state = self._REASON_TO_TURN.get(reason)
+            if state and state != self._last_turn_state:
+                self._last_turn_state = state
+                self._rpc.broadcast_threadsafe("conversation.turn", {"state": state})
+
+    def _emit_phase(self, phase: str, reason: Optional[str] = None) -> None:
+        """Push a conversation.phase notification to JSON-RPC clients."""
+        if self._rpc is not None:
+            self._rpc.broadcast_threadsafe("conversation.phase", {"phase": phase, "reason": reason})
+
+    def seconds_since_activity(self) -> float:
+        """Seconds since the live handler last saw conversation activity."""
+        return time.monotonic() - self.handler.last_activity_time
+
+    def _backend_connected(self) -> bool:
+        """Return whether the active handler currently has a realtime connection."""
+        try:
+            handler_state = vars(self.handler)
+        except TypeError:
+            handler_state = {}
+        return handler_state.get("connection") is not None
+
+    def _can_rebuild_handler(self) -> bool:
+        """Return whether LocalStream can construct handlers for backend changes."""
+        return self._handler_factory is not None
+
+    def _build_handler_for_current_backend(self) -> ConversationHandler:
+        """Create and install a fresh handler for the current runtime backend config."""
+        if self._handler_factory is None:
+            return self.handler
+        handler = self._handler_factory(self._voice_override)
+        self._install_handler(handler)
+        return handler
+
+    async def _shutdown_active_handler(self) -> None:
+        """Best-effort shutdown for the currently active handler."""
+        try:
+            await self.handler.shutdown()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug("Active handler shutdown ignored during restart: %s", e)
+
+    def _mark_restart_requested(self, reason: str) -> None:
+        """Request a backend restart from a synchronous route handler."""
+        logger.info("Backend restart requested: %s", reason)
+        self._set_backend_connection_state("connecting")
+        loop = self._asyncio_loop
+        if loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self.request_backend_restart(reason), loop)
+            return
+        self._restart_requested.set()
+
+    async def request_backend_restart(self, reason: str) -> None:
+        """Ask the startup loop to rebuild the backend and stop the current handler."""
+        self._set_backend_connection_state("connecting")
+        self._restart_requested.set()
+        await self._shutdown_active_handler()
+
+    async def _sleep_or_restart_requested(self, delay: float) -> None:
+        """Sleep for a retry interval, waking early if a restart is requested."""
+        if self._restart_requested.is_set():
             return
         try:
-            inst = Path(self._instance_path)
-            env_path = inst / ".env"
-            lines = self._read_env_lines(env_path)
-            for env_name, value in normalized_updates.items():
-                replaced = False
-                for i, ln in enumerate(lines):
-                    if ln.strip().startswith(f"{env_name}="):
-                        lines[i] = f"{env_name}={value}"
-                        replaced = True
-                        break
-                if not replaced:
-                    lines.append(f"{env_name}={value}")
-            final_text = "\n".join(lines) + "\n"
-            env_path.write_text(final_text, encoding="utf-8")
-            logger.info("Persisted %s to %s", ", ".join(sorted(normalized_updates)), env_path)
+            await asyncio.wait_for(self._restart_requested.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
 
-            try:
-                from dotenv import load_dotenv
+    @staticmethod
+    def _format_backend_error(error: BaseException | str) -> str:
+        """Return a compact user-facing backend error string."""
+        if isinstance(error, str):
+            return error
+        message = str(error).strip()
+        if message:
+            return f"{type(error).__name__}: {message}"
+        return type(error).__name__
 
-                load_dotenv(dotenv_path=str(env_path))
-            except Exception:
-                pass
-            refresh_runtime_config_from_env()
-        except Exception as e:
-            logger.warning("Failed to persist %s: %s", ", ".join(sorted(normalized_updates)), e)
+    def _set_backend_connection_state(self, state: str, error: BaseException | str | None = None) -> None:
+        """Update backend connection status exposed through the settings UI."""
+        self._backend_connection_state = state
+        if error is not None:
+            self._backend_error = self._format_backend_error(error)
+        elif state != "disconnected":
+            self._backend_error = None
+
+    def _backend_connection_status(self) -> dict[str, object]:
+        """Return the backend connection state exposed in the settings API."""
+        connected = self._backend_connected()
+        state = "connected" if connected else self._backend_connection_state
+        return {
+            "backend_connected": connected,
+            "backend_connection_state": state,
+            "backend_error": None if connected else self._backend_error,
+        }
 
     def _remove_persisted_env_values(self, env_names: tuple[str, ...]) -> None:
         """Remove keys from the instance `.env` without mutating the current runtime."""
@@ -277,48 +417,59 @@ class LocalStream:
         except Exception as e:
             logger.warning("Failed to remove %s: %s", ", ".join(normalized_names), e)
 
+    def _save_settings(self, changes: AppSettings) -> None:
+        """Persist settings chosen through the UI and apply them right away."""
+        update_settings(self._instance_path, changes)
+        apply_settings_to_runtime(changes)
+
     def _persist_hf_direct_connection(self, host: str, port: int) -> None:
         """Persist a direct Hugging Face websocket target."""
-        self._persist_env_values(
-            {
-                HF_REALTIME_CONNECTION_MODE_ENV: HF_LOCAL_CONNECTION_MODE,
-                HF_REALTIME_WS_URL_ENV: build_hf_direct_ws_url(host, port),
-            }
+        self._save_settings(
+            AppSettings(
+                hf_connection_mode=HF_LOCAL_CONNECTION_MODE,
+                hf_ws_url=build_hf_direct_ws_url(host, port),
+            )
         )
 
     def _persist_hf_allocator_connection(self) -> None:
         """Persist the deployed Hugging Face allocator mode."""
-        self._persist_env_value(HF_REALTIME_CONNECTION_MODE_ENV, HF_DEPLOYED_CONNECTION_MODE)
+        self._save_settings(AppSettings(hf_connection_mode=HF_DEPLOYED_CONNECTION_MODE))
+        # Older installs kept an allocator URL in the instance .env; drop it so
+        # the stored mode is what decides.
         self._remove_persisted_env_values(("HF_REALTIME_SESSION_URL",))
 
-    def _persist_api_key(self, key: str) -> None:
-        """Persist OPENAI_API_KEY to environment and instance `.env`."""
-        self._persist_env_value("OPENAI_API_KEY", key)
+    def _apply_setting_with_restart(self, changes: AppSettings, reason: str) -> str:
+        """Persist one setting and reconnect the backend so it takes effect."""
+        self._save_settings(changes)
+        if not self._can_rebuild_handler():
+            return "Saved. Restart Reachy Mini Conversation to apply it."
+        self._mark_restart_requested(reason)
+        return "Saved. Reconnecting the conversation to apply it."
 
-    def _persist_gemini_api_key(self, key: str) -> None:
-        """Persist GEMINI_API_KEY to environment and instance `.env`."""
-        self._persist_env_value("GEMINI_API_KEY", key)
+    async def _refresh_instructions(self) -> bool:
+        """Push rebuilt instructions to the live session (see memory.clear)."""
+        return await self.handler.refresh_instructions()
 
-    def _persist_backend_choice(self, backend: str) -> None:
-        """Persist the selected backend without clobbering explicit model overrides."""
-        current_backend = get_backend_choice()
-        current_model_name = (os.getenv("MODEL_NAME") or "").strip()
-        updates = {"BACKEND_PROVIDER": backend}
-        if backend == HF_BACKEND:
-            self._persist_env_values(updates)
-            try:
-                os.environ.pop("MODEL_NAME", None)
-            except Exception:
-                pass
-            self._remove_persisted_env_values(("MODEL_NAME",))
-            refresh_runtime_config_from_env()
-            return
+    def _set_memory_enabled(self, enabled: bool) -> None:
+        """Turn long-term memory on or off, for this run and the next ones.
 
-        if current_model_name and current_model_name != get_model_name_for_backend(current_backend):
-            updates["MODEL_NAME"] = current_model_name
+        The prompt builder and the memory tools read the flag live, so the
+        caller only has to refresh the session instructions, not reconnect.
+        """
+        self._save_settings(AppSettings(memory_enabled=enabled))
+
+    def _set_language(self, language: str, scope: LanguageScope) -> str:
+        """Save the conversation language for the active personality or all of them, then reconnect."""
+        if scope == "profile":
+            profile = canonical_profile_name(config.REACHY_MINI_CUSTOM_PROFILE)
+            changes = AppSettings(profile_languages={**config.PROFILE_LANGUAGES, profile: language})
         else:
-            updates["MODEL_NAME"] = get_model_name_for_backend(backend)
-        self._persist_env_values(updates)
+            changes = AppSettings(language=language, profile_languages={})
+        return self._apply_setting_with_restart(changes, "language_changed")
+
+    def _persist_camera_enabled(self, enabled: bool) -> None:
+        """Remember the camera switch across restarts."""
+        self._save_settings(AppSettings(camera_enabled=enabled))
 
     def _persist_personality(self, profile: Optional[str], voice_override: Optional[str] = None) -> None:
         """Persist startup profile and voice in instance-local UI settings."""
@@ -326,12 +477,7 @@ class LocalStream:
             return
         selection = (profile or "").strip() or None
         normalized_voice_override = (voice_override or "").strip() or None
-        try:
-            from reachy_mini_conversation_app.config import set_custom_profile
-
-            set_custom_profile(selection)
-        except Exception:
-            pass
+        set_custom_profile(selection)
 
         if not self._instance_path:
             return
@@ -350,6 +496,65 @@ class LocalStream:
         """Read the saved startup personality from instance-local UI settings."""
         return read_startup_settings(self._instance_path).profile
 
+    async def apply_personality(self, profile: Optional[str]) -> str:
+        """Apply a personality by updating config and restarting the active backend."""
+        previous_profile = config.REACHY_MINI_CUSTOM_PROFILE
+        set_custom_profile(profile)
+        try:
+            get_session_instructions()
+            get_session_voice(default=get_default_voice())
+            initialize_tools(force=True)
+        except Exception:
+            set_custom_profile(previous_profile)
+            raise
+
+        await self.request_backend_restart("personality_changed")
+        return "Applied personality and restarting backend."
+
+    async def get_available_voices(self) -> list[str]:
+        """Return the voices available for the Hugging Face backend."""
+        return get_available_voices()
+
+    def get_current_voice(self) -> str:
+        """Return the currently selected voice override or profile voice."""
+        if self._voice_override:
+            return self._voice_override
+        try:
+            return get_session_voice(default=get_default_voice())
+        except Exception as exc:
+            logger.warning("Failed to resolve the current profile voice: %s", exc)
+            return get_default_voice()
+
+    async def change_voice(self, voice: str) -> str:
+        """Change the voice through the active handler without rebuilding the backend."""
+        try:
+            status = await self.handler.change_voice(voice)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("Error changing voice to %r: %s", voice, e)
+            return f"Failed to change voice: {e}"
+
+        try:
+            current_voice = self.handler.get_current_voice()
+            if isinstance(current_voice, str) and current_voice.strip():
+                self._voice_override = current_voice
+        except Exception as e:
+            logger.debug("Could not sync LocalStream voice override after voice change: %s", e)
+        if self._voice_override:
+            self._persist_voice_override(self._voice_override)
+        return status
+
+    def _persist_voice_override(self, voice: str) -> None:
+        """Persist the chosen voice as the startup voice, keeping the startup profile."""
+        if not self._instance_path:
+            return
+        try:
+            existing = read_startup_settings(self._instance_path)
+            write_startup_settings(self._instance_path, profile=existing.profile, voice=voice)
+        except Exception as e:
+            logger.warning("Failed to persist startup voice: %s", e)
+
     def _init_settings_ui_if_needed(self) -> None:
         """Attach minimal settings UI to the settings app.
 
@@ -360,175 +565,289 @@ class LocalStream:
             return
         if self._settings_app is None:
             return
+        settings_app = self._settings_app
 
         static_dir = Path(__file__).parent / "static"
         index_file = static_dir / "index.html"
+        logger.info("Serving settings UI from %s", static_dir)
 
-        if hasattr(self._settings_app, "mount"):
+        # Framework pre-registers GET / and /static; strip them so our routes aren't shadowed.
+        _detach_framework_root_routes(settings_app)
+
+        if hasattr(settings_app, "mount"):
             try:
-                # Serve /static/* assets
-                self._settings_app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+                settings_app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
             except Exception:
-                pass
-
-        class ApiKeyPayload(BaseModel):
-            openai_api_key: str
-
-        class BackendPayload(BaseModel):
-            backend: str
-            api_key: Optional[str] = None
-            hf_mode: Optional[str] = None
-            hf_host: Optional[str] = None
-            hf_port: Optional[int] = None
+                logger.exception("Failed to mount settings UI static assets")
+                raise
 
         def _status_payload() -> dict[str, object]:
-            backend_provider = get_backend_choice()
-            active_backend = self._active_backend()
-            has_openai_key = self._has_required_key(OPENAI_BACKEND)
-            has_gemini_key = self._has_required_key(GEMINI_BACKEND)
             hf_session_url = get_hf_session_url()
             hf_ws_url = get_hf_direct_ws_url()
             hf_direct_host, hf_direct_port = parse_hf_direct_target(hf_ws_url)
-            has_hf_session_url = bool(hf_session_url)
-            has_hf_ws_url = bool(hf_ws_url)
             hf_connection_selection = get_hf_connection_selection()
-            hf_connection_mode = hf_connection_selection.mode
             has_hf_connection = hf_connection_selection.has_target
-            can_proceed_with_openai = has_openai_key
-            can_proceed_with_gemini = has_gemini_key
-            can_proceed_with_hf = has_hf_connection
-            can_proceed = self._has_required_key(active_backend)
-            requires_restart = backend_provider != active_backend
+            backend_connection = self._backend_connection_status()
             return {
-                "active_backend": active_backend,
-                "backend_provider": backend_provider,
-                "has_key": can_proceed,
-                "has_openai_key": has_openai_key,
-                "has_gemini_key": has_gemini_key,
-                "has_hf_session_url": has_hf_session_url,
-                "has_hf_ws_url": has_hf_ws_url,
+                "backend": HF_BACKEND,
+                "has_key": has_hf_connection,
+                "has_hf_session_url": bool(hf_session_url),
+                "has_hf_ws_url": bool(hf_ws_url),
                 "has_hf_connection": has_hf_connection,
-                "hf_connection_mode": hf_connection_mode,
+                "hf_connection_mode": hf_connection_selection.mode,
                 "hf_direct_host": hf_direct_host,
                 "hf_direct_port": hf_direct_port,
-                "can_proceed": can_proceed,
-                "can_proceed_with_openai": can_proceed_with_openai,
-                "can_proceed_with_gemini": can_proceed_with_gemini,
-                "can_proceed_with_hf": can_proceed_with_hf,
-                "requires_restart": requires_restart,
+                "can_proceed": has_hf_connection,
+                "can_proceed_with_hf": has_hf_connection,
+                "requires_restart": not self._can_rebuild_handler(),
+                # What the mobile client would otherwise need four more calls for.
+                "personality": config.REACHY_MINI_CUSTOM_PROFILE,
+                "voice": self.get_current_voice(),
+                "language": get_session_language(),
+                "memory_enabled": config.MEMORY_ENABLED,
+                "local_vad_enabled": config.LOCAL_VAD_ENABLED,
+                "local_barge_in_enabled": config.LOCAL_BARGE_IN_ENABLED,
+                "vision_enabled": bool(self._tool_deps and self._tool_deps.camera_enabled),
+                **backend_connection,
             }
 
         # GET / -> index.html
-        @self._settings_app.get("/")
+        @settings_app.get("/")
         def _root() -> FileResponse:
             return FileResponse(str(index_file))
 
         # GET /favicon.ico -> optional, avoid noisy 404s on some browsers
-        @self._settings_app.get("/favicon.ico")
+        @settings_app.get("/favicon.ico")
         def _favicon() -> Response:
             return Response(status_code=204)
 
-        # GET /status -> whether key is set
-        @self._settings_app.get("/status")
-        def _status() -> JSONResponse:
-            return JSONResponse(_status_payload())
+        # ── JSON-RPC control surface (/rpc) ──────────────────────────────
+        # The single wire format both the local browser UI and remote WebRTC
+        # clients use (the daemon relays it over the DataChannel). Notifications
+        # (conversation.turn/phase/transcript/latency/activity) are pushed from activity.
+        rpc = JsonRpcServer()
 
-        # GET /ready -> whether backend finished loading tools
-        @self._settings_app.get("/ready")
-        def _ready() -> JSONResponse:
-            try:
-                mod = sys.modules.get("reachy_mini_conversation_app.tools.core_tools")
-                ready = bool(getattr(mod, "_TOOLS_INITIALIZED", False)) if mod else False
-            except Exception:
-                ready = False
-            return JSONResponse({"ready": ready})
+        # SDK isn't marked py.typed, so mypy sees rpc.method as untyped; safe here.
+        @rpc.method("conversation.status")  # type: ignore[untyped-decorator]
+        def _rpc_status(_params: dict[str, object]) -> dict[str, object]:
+            return _status_payload()
 
-        # POST /openai_api_key -> set/persist key
-        @self._settings_app.post("/openai_api_key")
-        def _set_key(payload: ApiKeyPayload) -> JSONResponse:
-            key = (payload.openai_api_key or "").strip()
-            if not key:
-                return JSONResponse({"ok": False, "error": "empty_key"}, status_code=400)
-            self._persist_api_key(key)
-            return JSONResponse({"ok": True, **_status_payload()})
+        @rpc.method("conversation.say")  # type: ignore[untyped-decorator]
+        async def _rpc_say(params: dict[str, object]) -> dict[str, object]:
+            text = str(params.get("text", "")).strip()
+            if not text:
+                raise JsonRpcError("say requires 'text'", reason="invalid_params", code=-32602)
+            if not self.handler._is_connected():
+                raise JsonRpcError("no active session", reason="not_running")
+            await self.handler.interrupt()
+            await self.handler.say(text)
+            return {"ok": True}
 
-        @self._settings_app.post("/backend_config")
-        def _set_backend(payload: BackendPayload) -> JSONResponse:
-            backend = payload.backend.strip().lower()
-            if backend not in {OPENAI_BACKEND, GEMINI_BACKEND, HF_BACKEND}:
-                return JSONResponse({"ok": False, "error": "invalid_backend"}, status_code=400)
+        @rpc.method("conversation.interrupt")  # type: ignore[untyped-decorator]
+        async def _rpc_interrupt(_params: dict[str, object]) -> dict[str, object]:
+            if not self.handler._is_connected():
+                raise JsonRpcError("no active session", reason="not_running")
+            await self.handler.interrupt()
+            self._last_turn_state = "listening"
+            rpc.broadcast_threadsafe("conversation.turn", {"state": "listening", "reason": "interrupted"})
+            return {"ok": True}
 
-            api_key = (payload.api_key or "").strip()
-            if backend == GEMINI_BACKEND and not api_key and not self._has_required_key(GEMINI_BACKEND):
-                return JSONResponse({"ok": False, "error": "empty_key"}, status_code=400)
+        @rpc.method("conversation.history")  # type: ignore[untyped-decorator]
+        def _rpc_history(_params: dict[str, object]) -> dict[str, object]:
+            return {"events": list(self._conversation_history)}
 
-            if backend == OPENAI_BACKEND and api_key:
-                self._persist_api_key(api_key)
-            if backend == GEMINI_BACKEND and api_key:
-                self._persist_gemini_api_key(api_key)
-            if backend == HF_BACKEND:
-                hf_selection = get_hf_connection_selection()
-                hf_mode = (payload.hf_mode or hf_selection.mode).strip().lower()
-                if hf_mode == HF_LOCAL_CONNECTION_MODE:
-                    existing_host, existing_port = parse_hf_direct_target(hf_selection.direct_ws_url)
-                    host = (payload.hf_host or "").strip() or existing_host or ""
-                    if not host:
-                        return JSONResponse({"ok": False, "error": "empty_hf_host"}, status_code=400)
-                    if "://" in host or "/" in host or "?" in host or "#" in host:
-                        return JSONResponse({"ok": False, "error": "invalid_hf_host"}, status_code=400)
+        @rpc.method("conversation.mic")  # type: ignore[untyped-decorator]
+        def _rpc_mic(params: dict[str, object]) -> dict[str, object]:
+            if "muted" in params:
+                self._mic_muted = bool(params["muted"])
+                logger.info("Microphone %s via /rpc", "muted" if self._mic_muted else "unmuted")
+            return {"muted": self._mic_muted}
 
-                    port = payload.hf_port if payload.hf_port is not None else existing_port or 8765
-                    if port < 1 or port > 65535:
-                        return JSONResponse({"ok": False, "error": "invalid_hf_port"}, status_code=400)
+        @rpc.method("backend.config")  # type: ignore[untyped-decorator]
+        def _rpc_backend_config(params: dict[str, object]) -> dict[str, object]:
+            hf_selection = get_hf_connection_selection()
+            hf_mode = str(params.get("hf_mode") or hf_selection.mode).strip().lower()
+            if hf_mode == HF_LOCAL_CONNECTION_MODE:
+                existing_host, existing_port = parse_hf_direct_target(hf_selection.direct_ws_url)
+                host = str(params.get("hf_host") or "").strip() or existing_host or ""
+                if not host:
+                    raise JsonRpcError("Hugging Face host required", reason="empty_hf_host", code=-32602)
+                if "://" in host or "/" in host or "?" in host or "#" in host:
+                    raise JsonRpcError("invalid Hugging Face host", reason="invalid_hf_host", code=-32602)
+                raw_port = params.get("hf_port")
+                port = int(raw_port) if isinstance(raw_port, (int, float, str)) else (existing_port or 8765)
+                if port < 1 or port > 65535:
+                    raise JsonRpcError("invalid Hugging Face port", reason="invalid_hf_port", code=-32602)
+                self._persist_hf_direct_connection(host, port)
+            elif hf_mode == HF_DEPLOYED_CONNECTION_MODE:
+                if not bool(get_hf_session_url()):
+                    raise JsonRpcError(
+                        "missing Hugging Face session url", reason="missing_hf_session_url", code=-32602
+                    )
+                self._persist_hf_allocator_connection()
+            else:
+                raise JsonRpcError("invalid Hugging Face mode", reason="invalid_hf_mode", code=-32602)
 
-                    self._persist_hf_direct_connection(host, port)
-                elif hf_mode == HF_DEPLOYED_CONNECTION_MODE:
-                    if not bool(get_hf_session_url()):
-                        return JSONResponse({"ok": False, "error": "missing_hf_session_url"}, status_code=400)
-                    self._persist_hf_allocator_connection()
-                else:
-                    return JSONResponse({"ok": False, "error": "invalid_hf_mode"}, status_code=400)
+            if self._can_rebuild_handler():
+                self._mark_restart_requested("backend_config_changed")
+                message = "Connection saved. Reconnecting backend."
+            else:
+                message = "Connection saved. Restart Reachy Mini Conversation from the desktop app to apply it."
+            return {"ok": True, "message": message, **_status_payload()}
 
-            self._persist_backend_choice(backend)
-            payload_data = _status_payload()
-            message = "Backend saved."
-            if payload_data["requires_restart"]:
-                message = "Backend saved. Restart Reachy Mini Conversation from the desktop app to apply it."
-            return JSONResponse(
-                {
-                    "ok": True,
-                    "message": message,
-                    **payload_data,
-                }
+        def _rpc_speech_config(params: dict[str, object]) -> dict[str, object]:
+            names = ("local_vad_enabled", "local_barge_in_enabled")
+            for name in names:
+                if name in params and not isinstance(params[name], bool):
+                    raise JsonRpcError(f"{name} must be a boolean", reason="invalid_params", code=-32602)
+            enabled = params.get("local_vad_enabled")
+            barge_in = params.get("local_barge_in_enabled")
+            message = ""
+            if (isinstance(enabled, bool) and enabled != config.LOCAL_VAD_ENABLED) or (
+                isinstance(barge_in, bool) and barge_in != config.LOCAL_BARGE_IN_ENABLED
+            ):
+                message = self._apply_setting_with_restart(
+                    AppSettings(
+                        local_vad_enabled=enabled if isinstance(enabled, bool) else None,
+                        local_barge_in_enabled=barge_in if isinstance(barge_in, bool) else None,
+                    ),
+                    "speech_settings_changed",
+                )
+            return {
+                "local_vad_enabled": config.LOCAL_VAD_ENABLED,
+                "local_barge_in_enabled": config.LOCAL_BARGE_IN_ENABLED,
+                "message": message,
+                "requires_restart": not self._can_rebuild_handler(),
+            }
+
+        rpc.register("speech.config", _rpc_speech_config)
+        rpc.mount(settings_app)
+        self._rpc = rpc
+
+        try:
+            personality_ops = build_personality_ops(
+                self.handler,
+                lambda: self._asyncio_loop,
+                persist_personality=self._persist_personality,
+                get_persisted_personality=self._read_persisted_personality,
+                apply_personality=self.apply_personality,
+                get_voices=self.get_available_voices,
+                get_current_voice=self.get_current_voice,
+                change_voice=self.change_voice,
             )
+            # personalities.* / voices.* over JSON-RPC — the local UI and remote
+            # clients drive personalities the same way, one control surface.
+            register_personality_methods(rpc, personality_ops)
+        except Exception:
+            logger.exception("Failed to register personality methods; the personality UI will be unavailable")
 
-        # POST /validate_api_key -> validate key without persisting it
-        @self._settings_app.post("/validate_api_key")
-        async def _validate_key(payload: ApiKeyPayload) -> JSONResponse:
-            key = (payload.openai_api_key or "").strip()
-            if not key:
-                return JSONResponse({"valid": False, "error": "empty_key"}, status_code=400)
+        try:
+            register_tool_space_methods(
+                rpc,
+                lambda: self._asyncio_loop,
+                self.request_backend_restart,
+                instance_path=self._instance_path,
+            )
+        except Exception:
+            logger.exception("Failed to register Tool Space methods; remote tool settings will be unavailable")
 
-            # Try to validate by checking if we can fetch the models
+        try:
+            register_profile_tool_methods(
+                rpc,
+                lambda: self._asyncio_loop,
+                self.request_backend_restart,
+                instance_path=self._instance_path,
+            )
+        except Exception:
+            logger.exception("Failed to register profile tool methods; personality tool settings will be unavailable")
+
+        try:
+            # memory.* / language.* / vision.* — the settings a remote client
+            # (the mobile app) shows next to the personality controls.
+            register_memory_methods(
+                rpc,
+                instance_path=self._instance_path,
+                set_enabled=self._set_memory_enabled,
+                refresh_instructions=self._refresh_instructions,
+            )
+        except Exception:
+            logger.exception("Failed to register memory methods; memory settings will be unavailable")
+
+        try:
+            register_language_methods(rpc, set_language=self._set_language)
+        except Exception:
+            logger.exception("Failed to register language methods; the language setting will be unavailable")
+
+        if self._tool_deps is not None:
             try:
-                import httpx
-
-                headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    response = await client.get("https://api.openai.com/v1/models", headers=headers)
-                    if response.status_code == 200:
-                        return JSONResponse({"valid": True})
-                    elif response.status_code == 401:
-                        return JSONResponse({"valid": False, "error": "invalid_api_key"}, status_code=401)
-                    else:
-                        return JSONResponse(
-                            {"valid": False, "error": "validation_failed"}, status_code=response.status_code
-                        )
-            except Exception as e:
-                logger.warning(f"API key validation failed: {e}")
-                return JSONResponse({"valid": False, "error": "validation_error"}, status_code=500)
+                register_vision_methods(
+                    rpc,
+                    self._tool_deps,
+                    self._persist_camera_enabled,
+                    forced_off=self._camera_forced_off,
+                )
+            except Exception:
+                logger.exception("Failed to register vision methods; the camera switch will be unavailable")
 
         self._settings_initialized = True
+
+    async def _run_handler_startup_loop(self) -> None:
+        """Start the realtime handler and keep settings UI alive after backend failures."""
+        while not self._stop_event.is_set():
+            if self._restart_requested.is_set():
+                await self._shutdown_active_handler()
+                if not self._can_rebuild_handler():
+                    self._restart_requested.clear()
+                    self._set_backend_connection_state("restart_required")
+                    await self._sleep_or_restart_requested(0.5)
+                    continue
+                self._restart_requested.clear()
+                try:
+                    self._build_handler_for_current_backend()
+                except Exception as e:
+                    self._set_backend_connection_state("disconnected", e)
+                    logger.warning(
+                        "Backend handler failed to initialize: %s. Retrying in %.1f seconds.",
+                        e,
+                        self._backend_retry_delay,
+                        exc_info=logger.isEnabledFor(logging.DEBUG),
+                    )
+                    await self._sleep_or_restart_requested(self._backend_retry_delay)
+                    continue
+
+            if not has_hf_realtime_target():
+                self._set_backend_connection_state(
+                    "waiting_for_config", f"{HF_REALTIME_WS_URL_ENV} is not configured."
+                )
+                await self._sleep_or_restart_requested(0.5)
+                continue
+
+            self._set_backend_connection_state("connecting")
+            try:
+                await self.handler.start_up()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._set_backend_connection_state("disconnected", e)
+                logger.warning(
+                    "Backend failed to start: %s. Settings UI remains available; retrying in %.1f seconds.",
+                    e,
+                    self._backend_retry_delay,
+                    exc_info=logger.isEnabledFor(logging.DEBUG),
+                )
+            else:
+                if self._stop_event.is_set():
+                    return
+                self._set_backend_connection_state("disconnected")
+                if self._restart_requested.is_set():
+                    logger.info("Backend stopped for requested restart.")
+                    continue
+                logger.info(
+                    "Backend session ended. Settings UI remains available; retrying in %.1f seconds.",
+                    self._backend_retry_delay,
+                )
+
+            await self._sleep_or_restart_requested(self._backend_retry_delay)
 
     def launch(self) -> None:
         """Start the recorder/player and run the async processing loops.
@@ -550,59 +869,57 @@ class LocalStream:
                     refresh_runtime_config_from_env()
             except Exception:
                 pass  # Instance .env loading is optional; continue with defaults
-
-        active_backend = self._active_backend()
+            load_settings_into_runtime(self._instance_path)
 
         # Always expose settings UI if a settings app is available
         # (do this AFTER loading the instance .env so status endpoint sees the right value)
         self._init_settings_ui_if_needed()
 
-        # If key is still missing -> wait until provided via the settings UI
-        if not self._has_required_key(active_backend):
-            requirement_name = self._requirement_name(active_backend)
-            if active_backend == HF_BACKEND:
+        # If the Hugging Face target is still missing -> wait until provided via the settings UI
+        if not has_hf_realtime_target():
+            self._set_backend_connection_state("waiting_for_config", f"{HF_REALTIME_WS_URL_ENV} is not configured.")
+            if self._settings_app is None:
                 logger.error(
-                    "%s not found. Set it in the app .env before starting the Hugging Face backend.", requirement_name
+                    "%s not found. Set it in the app .env before starting the Hugging Face backend.",
+                    HF_REALTIME_WS_URL_ENV,
                 )
                 return
-            else:
-                logger.warning("%s not found. Open the app settings page to enter it.", requirement_name)
-            # Poll until the key becomes available (set via the settings UI)
+            logger.warning("%s not found. Open the app settings page to configure it.", HF_REALTIME_WS_URL_ENV)
+            # Poll until a target becomes available (set via the settings UI)
             try:
-                while not self._has_required_key(active_backend):
+                while not self._stop_event.is_set() and not has_hf_realtime_target():
                     time.sleep(0.2)
             except KeyboardInterrupt:
-                logger.info("Interrupted while waiting for API key.")
+                logger.info("Interrupted while waiting for Hugging Face configuration.")
                 return
+            if self._stop_event.is_set():
+                return
+            self._set_backend_connection_state("not_started")
 
         # Start media after key is set/available
+        self._audio_warming_up = True
         self._robot.media.start_recording()
         self._robot.media.start_playing()
-        time.sleep(1)  # give some time to the pipelines to start
-        apply_audio_startup_config(self._robot, logger=logger)
 
         async def runner() -> None:
             # Capture loop for cross-thread personality actions
             loop = asyncio.get_running_loop()
             self._asyncio_loop = loop  # type: ignore[assignment]
-            # Mount personality routes now that loop and handler are available
-            try:
-                if self._settings_app is not None:
-                    mount_personality_routes(
-                        self._settings_app,
-                        self.handler,
-                        lambda: self._asyncio_loop,
-                        persist_personality=self._persist_personality,
-                        get_persisted_personality=self._read_persisted_personality,
-                    )
-            except Exception:
-                pass
+            # Connect the backend first so it overlaps the warmup and audio config below.
+            handler_task = asyncio.create_task(self._run_handler_startup_loop(), name="realtime-handler")
             self._tasks = [
-                asyncio.create_task(self.handler.start_up(), name="openai-handler"),
+                handler_task,
                 asyncio.create_task(self.record_loop(), name="stream-record-loop"),
-                asyncio.create_task(self.play_loop(), name="stream-play-loop"),
             ]
             try:
+                await asyncio.gather(
+                    asyncio.sleep(1),  # give the pipelines time to start
+                    asyncio.to_thread(apply_audio_startup_config, self._robot, logger=logger),
+                )
+                if self._stop_event.is_set():
+                    return
+                self._audio_warming_up = False
+                self._tasks.append(asyncio.create_task(self.play_loop(), name="stream-play-loop"))
                 await asyncio.gather(*self._tasks)
             except asyncio.CancelledError:
                 logger.info("Tasks cancelled during shutdown")
@@ -634,122 +951,175 @@ class LocalStream:
         except Exception as e:
             logger.debug(f"Error stopping playback (may already be stopped): {e}")
 
-        # Now signal async loops to stop
-        self._stop_event.set()
-
-        # Cancel all running tasks
+        # close() runs on watcher threads, loop-owned state must change on the loop.
+        loop = self._asyncio_loop
+        if loop is None or not loop.is_running():
+            self._stop_event.set()
+            return
+        loop.call_soon_threadsafe(self._stop_event.set)
         for task in self._tasks:
             if not task.done():
-                task.cancel()
+                loop.call_soon_threadsafe(task.cancel)
 
-    def clear_audio_queue(self) -> None:
-        """Flush the player's appsrc to drop any queued audio immediately."""
-        logger.info("User intervention: flushing player queue")
-        if self._echo_gate is not None:
-            self._echo_gate.reset()
-        backend = getattr(self._robot.media, "backend", None)
-        audio = getattr(self._robot.media, "audio", None)
-        if audio is not None:
-            if (
-                LOCAL_PLAYER_BACKEND is not None
-                and backend == LOCAL_PLAYER_BACKEND
-                and hasattr(audio, "clear_player")
-                and callable(audio.clear_player)
-            ):
-                audio.clear_player()
-            elif (
-                backend == MediaBackend.WEBRTC
-                and hasattr(audio, "clear_output_buffer")
-                and callable(audio.clear_output_buffer)
-            ):
-                audio.clear_output_buffer()
-            elif hasattr(audio, "clear_output_buffer") and callable(audio.clear_output_buffer):
-                audio.clear_output_buffer()
-            elif hasattr(audio, "clear_player") and callable(audio.clear_player):
-                audio.clear_player()
-        self.handler.output_queue = asyncio.Queue()
+    async def clear_audio_queue(self) -> None:
+        """Invalidate pending chunks and flush SDK playback without blocking microphone capture."""
+        async with self._playback_flush_lock:
+            logger.info("User intervention: flushing player queue")
+            handler = self.handler
+            handler.playback_epoch += 1
+            handler.playback_until = 0.0
+            self._playback_clock = 0.0
+            if self._echo_gate is not None:
+                self._echo_gate.reset()
+            handler.playback_pending_frames = 0
+            handler.playback_ready.clear()
+            self._drain_output_queue()
+            audio = self._robot.media.audio
+            try:
+                if audio is not None:
+                    flush_task = asyncio.create_task(asyncio.to_thread(audio.clear_player))
+                    try:
+                        await asyncio.shield(flush_task)
+                    except asyncio.CancelledError:
+                        await flush_task
+                        raise
+            except (OSError, RuntimeError) as exc:
+                logger.warning("Failed to clear player queue: %s", exc)
+            finally:
+                handler.playback_ready.set()
+
+    def _drain_output_queue(self) -> None:
+        """Remove pending audio in place while retaining text and metadata."""
+        queue = getattr(self.handler, "output_queue", None)
+        if queue is None:
+            return
+        retained_outputs: list[AdditionalOutputs] = []
+        while not queue.empty():
+            try:
+                output = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if isinstance(output, AdditionalOutputs):
+                retained_outputs.append(output)
+            else:
+                self.handler.playback_frame_epochs.pop(id(output[1]), None)
+        for output in retained_outputs:
+            queue.put_nowait(output)
 
     def _mic_open(self) -> bool:
         """Whether mic frames may reach the wake-word detector and the handler."""
-        return self._echo_gate is None or self._echo_gate.is_open
+        return not self._mic_muted and (self._echo_gate is None or self._echo_gate.is_open)
+
+    def _note_playback(self, samples: int, sample_rate: int) -> None:
+        if self._echo_gate is not None:
+            self._echo_gate.note_playback(samples / sample_rate)
 
     async def record_loop(self) -> None:
-        """Read mic frames and forward them to the handler.
-
-        On Reachy Mini Wireless the SDK's GStreamer record pipeline sometimes
-        fails to start (state change error). Setting REACHY_DIRECT_ALSA_MIC=1
-        switches to a sounddevice-based capture from the configured ALSA device
-        (default: reachymini_audio_src dsnoop) which is the same source the
-        daemon publishes.
-        """
-        use_direct = (os.getenv("REACHY_DIRECT_ALSA_MIC") or "").strip() in {"1", "true", "yes", "on"}
-        if use_direct:
+        """Read mic frames from the recorder, or straight from ALSA when configured, and forward them."""
+        if (os.getenv(DIRECT_ALSA_MIC_ENV) or "").strip().lower() in TRUTHY_ENV_VALUES:
             await self._record_loop_direct_alsa()
             return
 
         input_sample_rate = self._robot.media.get_input_audio_samplerate()
         logger.debug(f"Audio recording started at {input_sample_rate} Hz")
 
-        while not self._stop_event.is_set():
-            audio_frame = self._robot.media.get_audio_sample()
-            if audio_frame is not None and self._mic_open():
-                await self.handler.receive((input_sample_rate, audio_frame))
-            await asyncio.sleep(0)  # avoid busy loop
+        loop = asyncio.get_running_loop()
+        frames: asyncio.Queue[AudioFrame] = asyncio.Queue()
+        stop_reading = threading.Event()
+
+        def read_microphone() -> None:
+            # The SDK read blocks up to 20 ms: one reader thread costs less than a thread hop per frame.
+            while not stop_reading.is_set() and not self._stop_event.is_set():
+                warming_up = self._audio_warming_up  # a read spanning the end of warmup still holds warmup audio
+                audio_frame = self._robot.media.get_audio_sample()
+                if audio_frame is not None and not warming_up:
+                    loop.call_soon_threadsafe(frames.put_nowait, (input_sample_rate, audio_frame))
+
+        reader = threading.Thread(target=read_microphone, name="microphone-reader", daemon=True)
+        reader.start()
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    frame = await asyncio.wait_for(frames.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    continue
+                if self._mic_open():
+                    await self.handler.receive(frame)
+                    self._emit_level("user", frame[1])
+        finally:
+            stop_reading.set()
+            await asyncio.to_thread(reader.join)
+
+    def _start_wake_word_detector(self, loop: asyncio.AbstractEventLoop) -> None:
+        if self._wake_word_coordinator is None or self._wake_word_detector is not None:
+            return
+        try:
+            from reachy_mini_conversation_app.wake_word.detector import build_wake_word_detector
+
+            self._wake_word_detector = build_wake_word_detector(on_wake=self._wake_word_coordinator.on_wake, loop=loop)
+            if self._wake_word_detector is not None:
+                self._wake_word_detector.start()
+        except Exception as exc:
+            logger.warning("Wake-word detector init failed: %s", exc)
+            self._wake_word_detector = None
+
+    def _wake_word_allows(self, sample: np.ndarray) -> bool:
+        """Feed the wake-word detector and report whether the frame may reach the handler."""
+        detector = self._wake_word_detector
+        if detector is None or self._wake_word_coordinator is None:
+            return True
+        try:
+            mono = downmix(sample.astype(np.float64), channel_mix())
+            detector.feed(np.clip(mono, -32768, 32767).astype(np.int16))
+        except Exception as exc:
+            logger.debug("wake-word feed failed: %s", exc)
+        return bool(self._wake_word_coordinator.is_active)
 
     async def _record_loop_direct_alsa(self) -> None:
-        """Capture mic directly from ALSA dsnoop, bypassing the SDK pipeline.
+        """Capture the mic from the ALSA dsnoop device the daemon publishes, bypassing the SDK pipeline.
 
-        Two-stage pipeline so the sounddevice audio callback never blocks:
-        - PortAudio callback drops one frame into a bounded asyncio queue.
-        - An async consumer drains the queue and awaits handler.receive().
+        The PortAudio callback only drops frames into a bounded queue so it never blocks;
+        this coroutine drains it and forwards frames to the handler.
         """
         try:
             import sounddevice as sd
         except ImportError:
-            logger.error("REACHY_DIRECT_ALSA_MIC=1 requires sounddevice. Install with: pip install sounddevice")
+            logger.error("%s=1 requires sounddevice (install the wake_word extra)", DIRECT_ALSA_MIC_ENV)
             return
 
-        device = (os.getenv("REACHY_ALSA_MIC_DEVICE") or "reachymini_audio_src").strip()
-        rate = int(os.getenv("REACHY_ALSA_MIC_RATE", "16000"))
-        channels = int(os.getenv("REACHY_ALSA_MIC_CHANNELS", "2"))
-        block = int(os.getenv("REACHY_ALSA_MIC_BLOCK", "1024"))
-        queue_size = int(os.getenv("REACHY_ALSA_MIC_QUEUE", "32"))
-
+        device = (os.getenv(ALSA_MIC_DEVICE_ENV) or DEFAULT_ALSA_MIC_DEVICE).strip()
+        rate = _int_env(ALSA_MIC_RATE_ENV, DEFAULT_ALSA_MIC_RATE)
+        channels = _int_env(ALSA_MIC_CHANNELS_ENV, DEFAULT_ALSA_MIC_CHANNELS)
+        block = _int_env(ALSA_MIC_BLOCK_ENV, DEFAULT_ALSA_MIC_BLOCK)
+        queue_size = _int_env(ALSA_MIC_QUEUE_ENV, DEFAULT_ALSA_MIC_QUEUE)
         logger.info(
             "Direct ALSA mic capture: device=%s rate=%d channels=%d block=%d queue=%d",
-            device, rate, channels, block, queue_size,
+            device,
+            rate,
+            channels,
+            block,
+            queue_size,
         )
 
-        import queue as _stdqueue
-
         loop = asyncio.get_running_loop()
-        frame_queue: "_stdqueue.Queue[Any]" = _stdqueue.Queue(maxsize=queue_size)
-        dropped = {"count": 0}
+        frames: "queue.Queue[Any]" = queue.Queue(maxsize=queue_size)
+        dropped = 0
+        forwarded = 0
+        self._start_wake_word_detector(loop)
 
-        if self._wake_word_coordinator is not None and self._wake_word_detector is None:
-            try:
-                from reachy_mini_conversation_app.wake_word.detector import build_wake_word_detector
-                self._wake_word_detector = build_wake_word_detector(
-                    on_wake=self._wake_word_coordinator.on_wake,
-                    loop=loop,
-                )
-                if self._wake_word_detector is not None:
-                    self._wake_word_detector.start()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Wake-word detector init failed: %s", exc)
-                self._wake_word_detector = None
-
-        def callback(indata, frames, time_info, status):  # type: ignore[no-untyped-def]
+        def callback(indata: Any, frame_count: int, time_info: Any, status: Any) -> None:
+            nonlocal dropped
             if status:
                 logger.debug("sounddevice status: %s", status)
+            if self._audio_warming_up:
+                return
             try:
-                frame_queue.put_nowait(indata.copy())
-            except _stdqueue.Full:
-                dropped["count"] += 1
-                if dropped["count"] % 50 == 1:
-                    logger.warning("Direct ALSA: queue full, dropped %d frames so far", dropped["count"])
+                frames.put_nowait(indata.copy())
+            except queue.Full:
+                dropped += 1
+                if dropped % ALSA_DROP_LOG_EVERY == 1:
+                    logger.warning("Direct ALSA: queue full, dropped %d frames so far", dropped)
 
-        forwarded = 0
         try:
             with sd.InputStream(
                 device=device,
@@ -760,47 +1130,29 @@ class LocalStream:
                 callback=callback,
             ):
                 while not self._stop_event.is_set():
-                    sample = await loop.run_in_executor(None, _get_with_timeout, frame_queue, 0.5)
-                    if sample is None or not self._mic_open():
+                    sample = await asyncio.to_thread(_get_with_timeout, frames, ALSA_MIC_POLL_SECONDS)
+                    if sample is None or not self._mic_open() or not self._wake_word_allows(sample):
                         continue
-                    if self._wake_word_detector is not None:
-                        try:
-                            if sample.ndim == 1:
-                                mono = sample
-                            else:
-                                # Match the gating downmix: per-sample louder channel (absmax).
-                                a32 = sample.astype("int32")
-                                if a32.shape[1] > 1:
-                                    abs_idx = np.abs(a32).argmax(axis=1)
-                                    mono = a32[np.arange(a32.shape[0]), abs_idx].astype("int16")
-                                else:
-                                    mono = a32[:, 0].astype("int16")
-                            self._wake_word_detector.feed(mono)
-                        except Exception as exc:  # noqa: BLE001
-                            logger.debug("wake-word feed failed: %s", exc)
-                    # Gate audio to Gemini behind the wake-word coordinator: only forward
-                    # frames during the active listening window (e.g. 12 s after wake fires).
-                    # If no detector is configured, always forward (legacy continuous mode).
-                    if self._wake_word_detector is not None and self._wake_word_coordinator is not None:
-                        forward_to_handler = self._wake_word_coordinator.is_active
-                    else:
-                        forward_to_handler = True
-                    if not forward_to_handler:
-                        continue
-                    try:
-                        await self.handler.receive((rate, sample))
-                        forwarded += 1
-                    except Exception as exc:  # noqa: BLE001
-                        logger.debug("handler.receive failed: %s", exc)
-        except Exception as exc:  # noqa: BLE001
+                    await self.handler.receive((rate, sample))
+                    self._emit_level("user", sample)
+                    forwarded += 1
+        except Exception as exc:
             logger.error("Direct ALSA capture failed: %s", exc)
         finally:
-            logger.info("Direct ALSA mic capture stopped; forwarded=%d dropped=%d", forwarded, dropped["count"])
+            if self._wake_word_detector is not None:
+                self._wake_word_detector.stop()
+                self._wake_word_detector = None
+            logger.info("Direct ALSA mic capture stopped; forwarded=%d dropped=%d", forwarded, dropped)
 
     async def play_loop(self) -> None:
         """Fetch outputs from the handler: log text and play audio frames."""
         while not self._stop_event.is_set():
-            handler_output = await self.handler.emit()
+            handler = self.handler
+            playback_epoch = handler.playback_epoch
+            try:
+                handler_output = await asyncio.wait_for(handler.emit(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
 
             if isinstance(handler_output, AdditionalOutputs):
                 for msg in handler_output.args:
@@ -813,8 +1165,12 @@ class LocalStream:
                         )
 
             elif isinstance(handler_output, tuple):
-                input_sample_rate, audio_data = handler_output
-                output_sample_rate = self._robot.media.get_output_audio_samplerate()
+                sample_rate, audio_data = handler_output
+                playback_epoch = handler.playback_frame_epochs.pop(id(audio_data), playback_epoch)
+                if handler is not self.handler or playback_epoch != handler.playback_epoch:
+                    continue
+                if handler.paced_playback is True:
+                    handler.playback_pending_frames = max(0, handler.playback_pending_frames - 1)
 
                 # Skip empty audio frames
                 if audio_data.size == 0:
@@ -822,7 +1178,7 @@ class LocalStream:
 
                 # Reshape if needed
                 if audio_data.ndim == 2:
-                    # Scipy channels last convention
+                    # channels-last convention
                     if audio_data.shape[1] > audio_data.shape[0]:
                         audio_data = audio_data.T
                     # Multiple channels -> Mono channel
@@ -832,24 +1188,36 @@ class LocalStream:
                 # Cast if needed
                 audio_frame = audio_to_float32(audio_data)
 
-                # Resample if needed
-                if input_sample_rate != output_sample_rate:
-                    num_samples = int(len(audio_frame) * output_sample_rate / input_sample_rate)
-                    if num_samples == 0:
+                if handler.paced_playback is True:
+                    chunk_samples = max(1, sample_rate // 50)
+                    for offset in range(0, audio_frame.size, chunk_samples):
+                        # One schedule across frames: the SDK lays follow-up buffers back to back and
+                        # only re-anchors after a 200 ms gap, so restarting per frame accumulated lateness.
+                        now = time.monotonic()
+                        if now > self._playback_clock + 0.2:
+                            self._playback_clock = now
+                        await asyncio.sleep(max(0.0, self._playback_clock - PLAYBACK_LEAD_SECONDS - now))
+                        await handler.playback_ready.wait()
+                        if (
+                            self._stop_event.is_set()
+                            or handler is not self.handler
+                            or playback_epoch != handler.playback_epoch
+                        ):
+                            break
+                        chunk = audio_frame[offset : offset + chunk_samples] * handler.playback_gain
+                        self._robot.media.push_audio_sample(chunk)
+                        self._note_playback(chunk.size, sample_rate)
+                        self._emit_level("assistant", chunk)
+                        self._playback_clock += chunk.size / sample_rate
+                        handler.playback_until = self._playback_clock + 0.1
+                else:
+                    # A flush in progress would drop or misplace this push.
+                    await handler.playback_ready.wait()
+                    if handler is not self.handler or playback_epoch != handler.playback_epoch:
                         continue
-                    audio_frame = resample(
-                        audio_frame,
-                        num_samples,
-                    )
-
-                head_wobbler = self.handler.deps.head_wobbler
-                if head_wobbler is not None:
-                    playback_delay_s = _estimate_pending_playback_seconds(self._robot)
-                    head_wobbler.feed_pcm(audio_data.reshape(1, -1), input_sample_rate, start_delay_s=playback_delay_s)
-
-                self._robot.media.push_audio_sample(audio_frame)
-                if self._echo_gate is not None:
-                    self._echo_gate.note_playback(len(audio_frame) / output_sample_rate)
+                    self._robot.media.push_audio_sample(audio_frame)
+                    self._note_playback(audio_frame.size, sample_rate)
+                    self._emit_level("assistant", audio_frame)
 
             else:
                 logger.debug("Ignoring output type=%s", type(handler_output).__name__)

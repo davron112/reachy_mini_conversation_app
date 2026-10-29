@@ -1,17 +1,14 @@
-"""Tests for the MCP bridge: config, selectors, adapter, registration and transport failures."""
+"""Tests for the MCP bridge: env config, selectors, discovery and registry integration."""
 
 import json
 import socket
 import asyncio
-import importlib
-from types import SimpleNamespace
-from typing import Any, Iterator
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any
 
 import pytest
 
 from reachy_mini_conversation_app.mcp_bridge import registry
-from reachy_mini_conversation_app.mcp_bridge.client import MCPSession, MCPBridgeError, _flatten_result
+from reachy_mini_conversation_app.mcp_client import RemoteToolSpec, McpTransportError, RemoteMcpToolClient
 from reachy_mini_conversation_app.mcp_bridge.config import (
     DEFAULT_SERVER_NAME,
     DEFAULT_CALL_TIMEOUT_S,
@@ -19,28 +16,20 @@ from reachy_mini_conversation_app.mcp_bridge.config import (
     MCPServerConfig,
     load_server_configs,
 )
-from reachy_mini_conversation_app.mcp_bridge.tool_adapter import MCPProxyTool, local_tool_name, normalize_schema
 
 
 def _server(name: str = "srv", url: str = "http://127.0.0.1:1/mcp", **kwargs: Any) -> MCPServerConfig:
     return MCPServerConfig(name=name, url=url, **kwargs)
 
 
-def _fake_session(name: str = "srv") -> MagicMock:
-    session = MagicMock(spec=MCPSession)
-    session.config = _server(name)
-    session.call_tool = AsyncMock()
-    return session
-
-
-def _core_tools() -> Any:
-    return importlib.import_module("reachy_mini_conversation_app.tools.core_tools")
-
-
-def test_mcpsession_requires_url() -> None:
-    """Empty URL must raise immediately, before any I/O."""
-    with pytest.raises(MCPBridgeError):
-        MCPSession(_server(url=""))
+def _spec(server: str, remote_name: str) -> RemoteToolSpec:
+    return RemoteToolSpec(
+        server_alias=server,
+        remote_name=remote_name,
+        namespaced_name=f"{server}__{remote_name}",
+        description=remote_name,
+        parameters_schema={"type": "object", "properties": {}},
+    )
 
 
 def test_config_empty_env_has_no_servers() -> None:
@@ -111,99 +100,6 @@ def test_config_duplicate_names_keep_first_and_bad_timeouts_fall_back() -> None:
     assert servers[0].call_timeout_s == DEFAULT_CALL_TIMEOUT_S
 
 
-def test_local_tool_name_is_server_scoped_and_sanitised() -> None:
-    """Remote names become `<server>_<tool>` limited to [A-Za-z0-9_] and 64 chars."""
-    assert local_tool_name("mcp", "web.search") == "mcp_web_search"
-    assert local_tool_name("my-home", "lights/on") == "my_home_lights_on"
-    assert len(local_tool_name("s", "x" * 200)) == 64
-
-
-def test_normalize_schema_fills_defaults_and_strips_meta_keys() -> None:
-    """Empty schemas become empty objects; `$schema`/`title` are dropped, properties survive."""
-    assert normalize_schema({}) == {"type": "object", "properties": {}, "required": []}
-    schema = {
-        "$schema": "x",
-        "title": "addArguments",
-        "type": "object",
-        "properties": {"q": {"type": "string"}},
-        "required": ["q"],
-    }
-    assert normalize_schema(schema) == {
-        "type": "object",
-        "properties": {"q": {"type": "string"}},
-        "required": ["q"],
-    }
-
-
-def test_proxy_tool_exposes_spec() -> None:
-    """The proxy spec carries the scoped name and the remote description."""
-    tool = MCPProxyTool(_fake_session("home"), remote_name="lights", description="Toggle", input_schema={})
-    spec = tool.spec()
-    assert spec["name"] == "home_lights"
-    assert spec["description"] == "Toggle"
-    assert spec["parameters"]["type"] == "object"
-
-
-@pytest.mark.asyncio
-async def test_proxy_call_forwards_args_and_flattens_result() -> None:
-    """Tool call args reach the session unchanged; text and data come back."""
-    session = _fake_session()
-    session.call_tool.return_value = {"is_error": False, "text": "result text", "data": [{"type": "image"}]}
-    tool = MCPProxyTool(session, remote_name="ping", description="d", input_schema={})
-    result = await tool(deps=MagicMock(), foo="bar")
-    session.call_tool.assert_awaited_once_with("ping", {"foo": "bar"})
-    assert result == {"text": "result text", "data": [{"type": "image"}]}
-
-
-@pytest.mark.asyncio
-async def test_proxy_call_empty_result_reports_ok() -> None:
-    """A successful call with no content still yields a non-empty result."""
-    session = _fake_session()
-    session.call_tool.return_value = {"is_error": False, "text": None, "data": None}
-    tool = MCPProxyTool(session, remote_name="ping", description="d", input_schema={})
-    assert await tool(deps=MagicMock()) == {"status": "ok"}
-
-
-@pytest.mark.asyncio
-async def test_proxy_call_surfaces_remote_error_field() -> None:
-    """When the remote reports is_error, the caller sees an error field."""
-    session = _fake_session()
-    session.call_tool.return_value = {"is_error": True, "text": "boom", "data": None}
-    tool = MCPProxyTool(session, remote_name="ping", description="d", input_schema={})
-    assert (await tool(deps=MagicMock())) == {"error": "boom"}
-
-
-@pytest.mark.asyncio
-async def test_proxy_call_wraps_bridge_error() -> None:
-    """Transport-level errors are surfaced via the error key."""
-    session = _fake_session()
-    session.call_tool.side_effect = MCPBridgeError("network down")
-    tool = MCPProxyTool(session, remote_name="ping", description="d", input_schema={})
-    assert (await tool(deps=MagicMock())) == {"error": "network down"}
-
-
-def test_flatten_result_prefers_text_and_keeps_other_content() -> None:
-    """Text blocks are joined; non-text blocks are kept; structured output only fills in for missing text."""
-    image = MagicMock(type="image")
-    image.model_dump.return_value = {"type": "image", "mimeType": "image/png"}
-    with_text = SimpleNamespace(
-        content=[SimpleNamespace(type="text", text="a"), SimpleNamespace(type="text", text="b"), image],
-        structured_content={"result": "ab"},
-        is_error=False,
-    )
-    assert _flatten_result(with_text) == {
-        "is_error": False,
-        "text": "a\nb",
-        "data": [{"type": "image", "value": {"type": "image", "mimeType": "image/png"}}],
-    }
-    structured_only = SimpleNamespace(content=[], structured_content={"x": 1}, is_error=True)
-    assert _flatten_result(structured_only) == {
-        "is_error": True,
-        "text": None,
-        "data": [{"type": "structured", "value": {"x": 1}}],
-    }
-
-
 @pytest.mark.parametrize(
     ("selectors", "server", "tool", "expected"),
     [
@@ -218,112 +114,80 @@ def test_flatten_result_prefers_text_and_keeps_other_content() -> None:
     ],
 )
 def test_is_selected(selectors: list[str], server: str, tool: str, expected: bool) -> None:
-    """Selector grammar from tools.txt matches servers and tools as documented."""
+    """The `mcp:` selector grammar matches servers and tools as documented."""
     assert registry.is_selected(server, tool, selectors) is expected
 
 
 @pytest.fixture
-def captured_registration(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[Any]]:
-    """Replace the global registry with a capture list so tests stay isolated."""
+def registered_providers(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Capture provider registration so tests never touch the global tool registry."""
     captured: list[Any] = []
-
-    def fake_register(tools: list[Any]) -> list[str]:
-        captured.extend(tools)
-        return [tool.name for tool in tools]
-
-    monkeypatch.setattr(registry, "register_runtime_tools", fake_register)
-    yield captured
+    monkeypatch.setattr(registry, "register_runtime_tool_provider", captured.append)
+    return captured
 
 
-@pytest.mark.asyncio
-async def test_build_bridge_skips_discovery_without_selectors(
-    monkeypatch: pytest.MonkeyPatch, captured_registration: list[Any]
-) -> None:
-    """A profile without `mcp:` entries never contacts any server."""
-    list_tools = AsyncMock()
-    monkeypatch.setattr(MCPSession, "list_tools", list_tools)
-    assert await registry.build_mcp_bridge(servers=[_server()], selectors=[]) == []
-    list_tools.assert_not_awaited()
+@pytest.fixture
+def fake_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Serve two tools per reachable server and refuse the server named `down`."""
+
+    async def list_tool_specs(self: RemoteMcpToolClient) -> list[RemoteToolSpec]:
+        alias = self.server.alias
+        if alias == "down":
+            raise McpTransportError("connection refused")
+        return [_spec(alias, "add"), _spec(alias, "secret")]
+
+    monkeypatch.setattr(RemoteMcpToolClient, "list_tool_specs", list_tool_specs)
 
 
 @pytest.mark.asyncio
-async def test_build_bridge_without_servers_returns_empty(captured_registration: list[Any]) -> None:
-    """No configured server means nothing is registered."""
-    assert await registry.build_mcp_bridge(servers=[], selectors=["*"]) == []
+async def test_build_bridge_without_servers_registers_nothing(registered_providers: list[Any]) -> None:
+    """No configured server means no provider and no network traffic."""
+    assert await registry.build_mcp_bridge(servers=[]) is None
+    assert registered_providers == []
 
 
 @pytest.mark.asyncio
-async def test_build_bridge_filters_tools_and_tolerates_failing_server(
-    monkeypatch: pytest.MonkeyPatch, captured_registration: list[Any]
-) -> None:
-    """Only selected tools of reachable servers are registered; a failing server is skipped."""
+@pytest.mark.usefixtures("fake_discovery")
+async def test_build_bridge_tolerates_failing_server_and_selects_per_profile(registered_providers: list[Any]) -> None:
+    """Reachable servers contribute their tools; selectors decide which ones a profile gets."""
+    catalog = await registry.build_mcp_bridge(servers=[_server("calc"), _server("down"), _server("other")])
 
-    async def fake_list_tools(self: MCPSession) -> list[dict[str, Any]]:
-        if self.config.name == "down":
-            raise MCPBridgeError("connection refused")
-        return [
-            {"name": "add", "description": "Add", "input_schema": {}},
-            {"name": "secret", "description": "Hidden", "input_schema": {}},
-        ]
+    assert registered_providers == [catalog]
+    assert catalog is not None
+    assert catalog.tool_names == ["calc__add", "calc__secret", "other__add", "other__secret"]
+    assert [tool.name for tool in catalog(["calc/add", "down"])] == ["calc__add"]
+    assert [tool.name for tool in catalog(["*/add"])] == ["calc__add", "other__add"]
+    assert catalog([]) == []
 
-    monkeypatch.setattr(MCPSession, "list_tools", fake_list_tools)
-    names = await registry.build_mcp_bridge(
-        servers=[_server("calc"), _server("down"), _server("other")],
-        selectors=["calc/add", "down"],
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("fake_discovery")
+async def test_discovered_tool_calls_its_own_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A selected tool forwards the call to the client of the server it was discovered on."""
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def call_tool(self: RemoteMcpToolClient, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        calls.append((self.server.alias, name, arguments))
+        return {"status": "ok", "namespaced_tool_name": name, "text": "3"}
+
+    monkeypatch.setattr(RemoteMcpToolClient, "call_tool", call_tool)
+    catalog = await registry.discover_mcp_tools([_server("calc", api_key="k")])
+    (tool,) = catalog(["calc/add"])
+
+    result = await tool(deps=None, a=1, b=2)  # type: ignore[arg-type]
+
+    assert calls == [("calc", "calc__add", {"a": 1, "b": 2})]
+    assert result["text"] == "3"
+    assert tool._client.server.headers["Authorization"] == "Bearer k"
+
+
+@pytest.mark.asyncio
+async def test_invalid_server_config_is_skipped() -> None:
+    """Remote plain-HTTP servers and unusable names are refused by the shared MCP client and skipped."""
+    catalog = await registry.discover_mcp_tools(
+        [_server("lan", url="http://192.0.2.1/mcp"), _server("bad-name", url="https://example.com/mcp")]
     )
-    assert names == ["calc_add"]
-    assert captured_registration[0].remote_name == "add"
-
-
-@pytest.mark.asyncio
-async def test_load_mcp_tools_runs_off_the_callers_loop(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Discovery runs on its own loop in a worker thread, so a running caller loop is untouched."""
-    caller_loop = asyncio.get_running_loop()
-    discovery_loops: list[asyncio.AbstractEventLoop] = []
-
-    async def fake_build() -> list[str]:
-        discovery_loops.append(asyncio.get_running_loop())
-        return ["x_y"]
-
-    monkeypatch.setattr(registry, "build_mcp_bridge", fake_build)
-
-    assert registry.load_mcp_tools() == ["x_y"]
-    assert discovery_loops and discovery_loops[0] is not caller_loop
-    assert asyncio.get_running_loop() is caller_loop
-
-
-def test_register_runtime_tools_never_overrides_builtins() -> None:
-    """An MCP tool whose scoped name equals a built-in (`task` + `status`) is rejected."""
-    core_tools = _core_tools()
-    builtin = core_tools.ALL_TOOLS["task_status"]
-    before = list(core_tools.ALL_TOOL_SPECS)
-    clash = MCPProxyTool(_fake_session("task"), remote_name="status", description="d", input_schema={})
-    assert clash.name == "task_status"
-    assert core_tools.register_runtime_tools([clash]) == []
-    assert core_tools.ALL_TOOLS["task_status"] is builtin
-    assert core_tools.ALL_TOOL_SPECS == before
-
-
-def test_register_runtime_tools_adds_and_skips_duplicates() -> None:
-    """First registration succeeds; a second tool with the same name is ignored."""
-    core_tools = _core_tools()
-    tool_a = MCPProxyTool(_fake_session(), remote_name="alpha_unique_xyz", description="d", input_schema={})
-    tool_b = MCPProxyTool(_fake_session(), remote_name="alpha_unique_xyz", description="d", input_schema={})
-
-    before = len(core_tools.ALL_TOOL_SPECS)
-    added = core_tools.register_runtime_tools([tool_a, tool_b])
-    try:
-        assert added == [tool_a.name]
-        assert core_tools.ALL_TOOLS[tool_a.name] is tool_a
-        assert len(core_tools.ALL_TOOL_SPECS) == before + 1
-    finally:
-        core_tools.ALL_TOOLS.pop(tool_a.name, None)
-        core_tools.ALL_TOOL_SPECS[:] = [s for s in core_tools.ALL_TOOL_SPECS if s.get("name") != tool_a.name]
-
-
-def test_register_runtime_tools_ignores_non_tool() -> None:
-    """Non-Tool objects in the input list are skipped, never crash."""
-    assert _core_tools().register_runtime_tools(["not a tool", object()]) == []
+    assert catalog.tool_names == []
 
 
 def _free_port() -> int:
@@ -333,20 +197,43 @@ def _free_port() -> int:
 
 
 @pytest.mark.asyncio
-async def test_session_unreachable_server_raises_bridge_error() -> None:
-    """A refused connection becomes MCPBridgeError instead of leaking transport exceptions."""
-    session = MCPSession(_server(url=f"http://127.0.0.1:{_free_port()}/mcp", discovery_timeout_s=2))
-    with pytest.raises(MCPBridgeError, match="failed"):
-        await session.list_tools()
+async def test_unreachable_server_contributes_nothing() -> None:
+    """A refused connection is logged and skipped instead of breaking startup."""
+    catalog = await registry.discover_mcp_tools(
+        [_server(url=f"http://127.0.0.1:{_free_port()}/mcp", discovery_timeout_s=2)]
+    )
+    assert catalog.tool_names == []
 
 
 @pytest.mark.asyncio
-async def test_session_silent_server_times_out() -> None:
-    """A server that accepts but never answers is bounded by the configured call timeout."""
+async def test_silent_server_is_bounded_by_discovery_timeout() -> None:
+    """A server that accepts but never answers cannot stall startup beyond the discovery timeout."""
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         port = listener.getsockname()[1]
-        session = MCPSession(_server(url=f"http://127.0.0.1:{port}/mcp", call_timeout_s=0.3))
-        with pytest.raises(MCPBridgeError, match="timed out"):
-            await session.call_tool("anything", {})
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        catalog = await registry.discover_mcp_tools(
+            [_server(url=f"http://127.0.0.1:{port}/mcp", discovery_timeout_s=0.3)]
+        )
+        assert catalog.tool_names == []
+        assert loop.time() - started < 5
+
+
+@pytest.mark.asyncio
+async def test_load_mcp_tools_runs_off_the_callers_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Discovery runs on its own loop in a worker thread, so a running caller loop is untouched."""
+    caller_loop = asyncio.get_running_loop()
+    discovery_loops: list[asyncio.AbstractEventLoop] = []
+    sentinel = registry.MCPToolCatalog([])
+
+    async def fake_build() -> registry.MCPToolCatalog:
+        discovery_loops.append(asyncio.get_running_loop())
+        return sentinel
+
+    monkeypatch.setattr(registry, "build_mcp_bridge", fake_build)
+
+    assert registry.load_mcp_tools() is sentinel
+    assert discovery_loops and discovery_loops[0] is not caller_loop
+    assert asyncio.get_running_loop() is caller_loop

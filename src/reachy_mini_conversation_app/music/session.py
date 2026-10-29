@@ -197,9 +197,7 @@ def _build_backend(name: BackendName) -> MusicBackend:
     if name == "yandex":
         token = os.getenv(ENV_YANDEX_TOKEN, "").strip()
         if not token:
-            raise MusicSessionError(
-                f"{ENV_YANDEX_TOKEN} is not set. Get a Yandex OAuth token and add it to .env."
-            )
+            raise MusicSessionError(f"{ENV_YANDEX_TOKEN} is not set. Get a Yandex OAuth token and add it to .env.")
         return YandexBackend(token=token)
     if name == "local":
         return LocalBackend(root=_resolve_local_root())

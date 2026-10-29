@@ -72,7 +72,8 @@ class VoskBackend(WakeWordBackend):
         self._recognizer = vosk.KaldiRecognizer(model, VOSK_SAMPLE_RATE, grammar)
         logger.info(
             "Vosk wake-word backend loaded: model=%s phrases=%s",
-            resolved, self._phrases,
+            resolved,
+            self._phrases,
         )
 
     def process(self, frame_int16: np.ndarray) -> list[tuple[str, float]]:
