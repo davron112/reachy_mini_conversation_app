@@ -119,7 +119,7 @@ def run(
 
     from reachy_mini_conversation_app.music import build_music_session
     from reachy_mini_conversation_app.console import LocalStream
-    from reachy_mini_conversation_app.mcp_bridge import build_mcp_bridge
+    from reachy_mini_conversation_app.mcp_bridge import load_mcp_tools
     from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
     from reachy_mini_conversation_app.audio.head_wobbler import HeadWobbler
 
@@ -185,16 +185,10 @@ def run(
     from reachy_mini_conversation_app.wake_word import WakeWordCoordinator
     wake_word_coordinator = WakeWordCoordinator(music_session=music_session)
 
-    mcp_bridge = None
-    if os.getenv("MCP_SERVER_URL", "").strip():
-        loop = asyncio.new_event_loop()
-        try:
-            mcp_bridge = loop.run_until_complete(build_mcp_bridge())
-        except Exception as mcp_exc:  # noqa: BLE001
-            logger.warning("MCP bridge unavailable: %s", mcp_exc)
-        finally:
-            loop.close()
-            asyncio.set_event_loop(asyncio.new_event_loop())
+    try:
+        load_mcp_tools()
+    except Exception as mcp_exc:  # noqa: BLE001
+        logger.warning("MCP tools unavailable: %s", mcp_exc)
 
     deps = ToolDependencies(
         reachy_mini=robot,

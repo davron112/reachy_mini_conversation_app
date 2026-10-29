@@ -8,7 +8,7 @@ import inspect
 import logging
 import importlib
 import importlib.util
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Sequence
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 ALL_TOOLS: Dict[str, "Tool"] = {}
 ALL_TOOL_SPECS: List[Dict[str, Any]] = []
+MCP_SELECTOR_PREFIX = "mcp:"
+_PROFILE_MCP_SELECTORS: List[str] = []
 _TOOLS_INITIALIZED = False
 
 
@@ -178,12 +180,16 @@ def _load_profile_tools() -> None:
         logger.error(f"✗ Failed to read tools.txt: {e}")
         sys.exit(1)
 
-    # Parse tool names (skip comments and blank lines)
+    # Parse tool names (skip comments and blank lines); `mcp:` entries select remote MCP tools
     tool_names = []
+    _PROFILE_MCP_SELECTORS.clear()
     for line in lines:
         line = line.strip()
         # Skip blank lines and comments
         if not line or line.startswith("#"):
+            continue
+        if line.startswith(MCP_SELECTOR_PREFIX):
+            _PROFILE_MCP_SELECTORS.append(line[len(MCP_SELECTOR_PREFIX) :].strip())
             continue
         tool_names.append(line)
 
@@ -281,7 +287,7 @@ _initialize_tools()
 _REQUIRED_TOOL_ATTRS: tuple[str, ...] = ("name", "description", "parameters_schema", "spec")
 
 
-def register_runtime_tools(tools: List["Tool"]) -> list[str]:
+def register_runtime_tools(tools: Sequence["Tool"]) -> list[str]:
     """Register pre-instantiated tool objects after _initialize_tools() has run.
 
     Uses duck typing so module-reload scenarios (where two copies of the Tool
@@ -305,6 +311,11 @@ def register_runtime_tools(tools: List["Tool"]) -> list[str]:
         added.append(name)
         logger.info("runtime tool registered: %s - %s", name, getattr(tool, "description", ""))
     return added
+
+
+def get_profile_mcp_selectors() -> list[str]:
+    """Return the profile's `mcp:` selectors from tools.txt, without the prefix."""
+    return list(_PROFILE_MCP_SELECTORS)
 
 
 def get_tool_specs(exclusion_list: list[str] = []) -> list[Dict[str, Any]]:

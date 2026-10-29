@@ -90,3 +90,24 @@ def test_builtin_profile_can_load_profile_local_tools(
     core_tools_mod = _reload_core_tools()
 
     assert "sweep_look" in core_tools_mod.ALL_TOOLS
+
+
+def test_mcp_selectors_are_parsed_from_tools_txt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`mcp:` lines become MCP selectors and are never loaded as Python tool modules."""
+    profile_name = "mcp_profile_test"
+    profiles_root = tmp_path / "profiles"
+    profile_dir = profiles_root / profile_name
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "instructions.txt").write_text("hello\n", encoding="utf-8")
+    (profile_dir / "tools.txt").write_text("dance\nmcp:*\nmcp: home/lights \n", encoding="utf-8")
+
+    monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", profile_name)
+    monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", profiles_root)
+    monkeypatch.setattr(config_mod.config, "TOOLS_DIRECTORY", None)
+    monkeypatch.setattr(config_mod.config, "AUTOLOAD_EXTERNAL_TOOLS", False)
+
+    core_tools_mod = _reload_core_tools()
+
+    assert core_tools_mod.get_profile_mcp_selectors() == ["*", "home/lights"]
+    assert "dance" in core_tools_mod.ALL_TOOLS
+    assert not any(name.startswith("mcp:") for name in core_tools_mod.ALL_TOOLS)

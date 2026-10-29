@@ -7,8 +7,8 @@ import pytest
 
 from reachy_mini_conversation_app.music.types import TrackInfo
 from reachy_mini_conversation_app.music.session import (
-    MIN_VOLUME,
     MAX_VOLUME,
+    MIN_VOLUME,
     MusicSession,
     MusicSessionError,
 )
@@ -51,6 +51,7 @@ def _fake_player() -> MagicMock:
 
 @pytest.mark.asyncio
 async def test_play_query_plays_top_and_queues_remainder() -> None:
+    """Playing a query starts the first hit and queues the rest."""
     backend = _fake_backend(search=[_track("1"), _track("2"), _track("3")])
     player = _fake_player()
     session = MusicSession(backend=backend, player=player)
@@ -64,6 +65,7 @@ async def test_play_query_plays_top_and_queues_remainder() -> None:
 
 @pytest.mark.asyncio
 async def test_play_query_raises_when_no_results() -> None:
+    """A query with no search results raises."""
     backend = _fake_backend(search=[])
     session = MusicSession(backend=backend, player=_fake_player())
     with pytest.raises(MusicSessionError):
@@ -72,6 +74,7 @@ async def test_play_query_raises_when_no_results() -> None:
 
 @pytest.mark.asyncio
 async def test_next_track_advances_and_then_stops() -> None:
+    """Next advances through the queue and stops at its end."""
     backend = _fake_backend(search=[_track("1"), _track("2")])
     player = _fake_player()
     session = MusicSession(backend=backend, player=player)
@@ -87,6 +90,7 @@ async def test_next_track_advances_and_then_stops() -> None:
 
 @pytest.mark.asyncio
 async def test_set_volume_clamps_into_range() -> None:
+    """Volume requests are clamped into the allowed range."""
     session = MusicSession(backend=_fake_backend(), player=_fake_player())
     assert await session.set_volume(500) == MAX_VOLUME
     assert await session.set_volume(-10) == MIN_VOLUME
@@ -94,6 +98,7 @@ async def test_set_volume_clamps_into_range() -> None:
 
 @pytest.mark.asyncio
 async def test_duck_and_unduck_round_trip() -> None:
+    """Ducking lowers the volume and unducking restores it."""
     backend = _fake_backend()
     player = _fake_player()
     player.get_volume = AsyncMock(return_value=80)
@@ -109,6 +114,7 @@ async def test_duck_and_unduck_round_trip() -> None:
 
 @pytest.mark.asyncio
 async def test_duck_noop_when_nothing_playing() -> None:
+    """Ducking with nothing playing is a no-op."""
     session = MusicSession(backend=_fake_backend(), player=_fake_player())
     await session.duck()
     session._player.set_volume.assert_not_called()  # type: ignore[attr-defined]
@@ -116,6 +122,7 @@ async def test_duck_noop_when_nothing_playing() -> None:
 
 @pytest.mark.asyncio
 async def test_kids_station_starts_from_top() -> None:
+    """The kids station starts from its first track."""
     backend = _fake_backend(kids=[_track("k1"), _track("k2")])
     session = MusicSession(backend=backend, player=_fake_player())
     track = await session.play_kids_station()

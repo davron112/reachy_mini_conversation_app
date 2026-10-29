@@ -1,5 +1,7 @@
-"""Reacts to wake-word detections: duck music, signal an attention move, and
-restore the music volume when the active window ends.
+"""React to wake-word detections by ducking music and opening an active window.
+
+An attention move is signalled on wake, and the music volume is restored when the
+active window ends.
 
 Music is ducked (volume lowered), never paused: ducking is orthogonal to
 transport, so explicit user commands during the window (pause/stop/next/play)
@@ -30,6 +32,7 @@ class WakeWordCoordinator:
         attention_cue: Optional[Callable[[], Awaitable[None]]] = None,
         active_window_s: float | None = None,
     ) -> None:
+        """Configure collaborators and the active-window length (env override when not given)."""
         self._music_session = music_session
         self._attention_cue = attention_cue
 
@@ -48,6 +51,7 @@ class WakeWordCoordinator:
 
     @property
     def is_active(self) -> bool:
+        """Return whether the post-wake active window is still open."""
         return time.monotonic() < self._active_until
 
     async def on_wake(self, label: str, score: float) -> None:

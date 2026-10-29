@@ -1,103 +1,92 @@
-"""Bootstrap an MCP session + register every discovered tool into ALL_TOOLS."""
+"""Discover tools on configured MCP servers and register the ones the profile selects."""
 
 from __future__ import annotations
-import os
 import asyncio
 import logging
-from dataclasses import field, dataclass
+from typing import Sequence
+from concurrent.futures import ThreadPoolExecutor
 
-from reachy_mini_conversation_app.tools.core_tools import register_runtime_tools
+from reachy_mini_conversation_app.tools.core_tools import register_runtime_tools, get_profile_mcp_selectors
 from reachy_mini_conversation_app.mcp_bridge.client import MCPSession, MCPBridgeError
+from reachy_mini_conversation_app.mcp_bridge.config import MCPServerConfig, load_server_configs
 from reachy_mini_conversation_app.mcp_bridge.tool_adapter import MCPProxyTool
 
 
 logger = logging.getLogger(__name__)
 
-ENV_URL = "MCP_SERVER_URL"
-ENV_API_KEY = "MCP_API_KEY"
-ENV_EXTRA_HEADERS = "MCP_EXTRA_HEADERS"  # JSON object string
-ENV_DISCOVERY_TIMEOUT = "MCP_DISCOVERY_TIMEOUT_S"
-
-DEFAULT_DISCOVERY_TIMEOUT_S = 15.0
+SELECT_ALL = "*"
+SELECTOR_SEPARATOR = "/"
 
 
-@dataclass
-class MCPBridge:
-    """Live MCP bridge: open session + the tools we registered locally."""
-
-    session: MCPSession
-    tool_names: list[str] = field(default_factory=list)
-
-    async def close(self) -> None:
-        """Tear down the underlying session."""
-        await self.session.close()
+def _split(selector: str) -> tuple[str, str]:
+    server, _, tool = selector.strip().partition(SELECTOR_SEPARATOR)
+    return server.strip(), tool.strip()
 
 
-def _parse_extra_headers(raw: str | None) -> dict[str, str]:
-    if not raw:
-        return {}
-    import json
+def _matches(pattern: str, value: str) -> bool:
+    return pattern in ("", SELECT_ALL) or pattern == value
 
+
+def server_is_selected(server_name: str, selectors: Sequence[str]) -> bool:
+    """Return whether any selector can match a tool of this server."""
+    return any(_split(selector)[0] in (SELECT_ALL, server_name) for selector in selectors)
+
+
+def is_selected(server_name: str, remote_name: str, selectors: Sequence[str]) -> bool:
+    """Match `*`, `<server>`, `<server>/*`, `*/<tool>` or `<server>/<tool>` selectors from tools.txt."""
+    for selector in selectors:
+        server, tool = _split(selector)
+        if server in (SELECT_ALL, server_name) and _matches(tool, remote_name):
+            return True
+    return False
+
+
+async def _discover_server(server: MCPServerConfig, selectors: Sequence[str]) -> list[MCPProxyTool]:
+    session = MCPSession(server)
     try:
-        decoded = json.loads(raw)
-    except json.JSONDecodeError:
-        logger.warning("%s is not valid JSON; ignoring", ENV_EXTRA_HEADERS)
-        return {}
-    if not isinstance(decoded, dict):
-        logger.warning("%s must be a JSON object; ignoring", ENV_EXTRA_HEADERS)
-        return {}
-    return {str(k): str(v) for k, v in decoded.items()}
-
-
-async def build_mcp_bridge() -> MCPBridge | None:
-    """Connect, discover tools, register them, return the live bridge.
-
-    Returns None when MCP is disabled (no URL) or discovery fails — callers should
-    treat that as "MCP unavailable" rather than fatal.
-    """
-    url = (os.getenv(ENV_URL) or "").strip()
-    if not url:
-        logger.info("MCP disabled: %s not set", ENV_URL)
-        return None
-
-    api_key = (os.getenv(ENV_API_KEY) or "").strip() or None
-    extra_headers = _parse_extra_headers(os.getenv(ENV_EXTRA_HEADERS))
-    try:
-        timeout_s = float(os.getenv(ENV_DISCOVERY_TIMEOUT, DEFAULT_DISCOVERY_TIMEOUT_S))
-    except ValueError:
-        timeout_s = DEFAULT_DISCOVERY_TIMEOUT_S
-
-    session = MCPSession(url=url, api_key=api_key, extra_headers=extra_headers)
-    try:
-        tools = await asyncio.wait_for(session.list_tools(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        logger.warning("MCP discovery timed out after %.1fs (url=%s)", timeout_s, url)
-        await session.close()
-        return None
+        specs = await session.list_tools()
     except MCPBridgeError as exc:
-        logger.warning("MCP discovery failed: %s", exc)
-        await session.close()
-        return None
-
-    if not tools:
-        logger.warning("MCP server returned 0 tools")
-        await session.close()
-        return None
-
-    proxies = [
+        logger.warning("MCP server %r unavailable, its tools are skipped: %s", server.name, exc)
+        return []
+    selected = [spec for spec in specs if is_selected(server.name, spec["name"], selectors)]
+    logger.info("MCP server %r: %d tool(s) offered, %d selected", server.name, len(specs), len(selected))
+    return [
         MCPProxyTool(
             session=session,
             remote_name=spec["name"],
             description=spec["description"],
-            input_schema=spec.get("inputSchema") or {},
+            input_schema=spec["input_schema"],
         )
-        for spec in tools
+        for spec in selected
     ]
-    registered = register_runtime_tools(proxies)
-    logger.info(
-        "MCP bridge ready: %d tool(s) registered from %s -> %s",
-        len(registered),
-        url,
-        registered,
-    )
-    return MCPBridge(session=session, tool_names=registered)
+
+
+async def discover_mcp_tools(servers: Sequence[MCPServerConfig], selectors: Sequence[str]) -> list[MCPProxyTool]:
+    """Query every relevant server concurrently; unreachable servers contribute nothing."""
+    relevant = [server for server in servers if server_is_selected(server.name, selectors)]
+    batches = await asyncio.gather(*(_discover_server(server, selectors) for server in relevant))
+    return [tool for batch in batches for tool in batch]
+
+
+async def build_mcp_bridge(
+    servers: Sequence[MCPServerConfig] | None = None,
+    selectors: Sequence[str] | None = None,
+) -> list[str]:
+    """Discover selected MCP tools and register them; return the registered tool names."""
+    servers = load_server_configs() if servers is None else servers
+    selectors = get_profile_mcp_selectors() if selectors is None else selectors
+    if not servers:
+        logger.info("MCP disabled: no server configured")
+        return []
+    if not selectors:
+        logger.info("MCP servers configured but the profile has no `mcp:` entries in tools.txt")
+        return []
+    registered = register_runtime_tools(await discover_mcp_tools(servers, selectors))
+    logger.info("MCP tools registered: %s", registered)
+    return registered
+
+
+def load_mcp_tools() -> list[str]:
+    """Run discovery on a private event loop in a worker thread, leaving the caller's loop untouched."""
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mcp-discovery") as executor:
+        return executor.submit(asyncio.run, build_mcp_bridge()).result()

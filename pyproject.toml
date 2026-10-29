@@ -54,7 +54,7 @@ music = [
   "python-vlc>=3.0.20",
 ]
 mcp = [
-  "mcp>=1.0",
+  "mcp>=2.0",
 ]
 wake_word = [
   "openwakeword>=0.6.0",
